@@ -115,6 +115,19 @@
 			qcom,client-id = <1>;
 			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>, <QCOM_SCM_VMID_NAV>;
 		};
+
+		/* Адрес и размеры -- РЕАЛЬНЫЕ, из downstream
+		 * m52xq_eur_open_w00_r05.dts (ramoops@F0B00000), не с FP5.
+		 * Фиксированный HW-карвaут, должен быть одинаковым независимо
+		 * от того, какая ОС на нём работает. */
+		ramoops@f0b00000 {
+			compatible = "ramoops";
+			reg = <0x0 0xf0b00000 0x0 0x100000>;
+			record-size = <0x40000>;
+			console-size = <0x40000>;
+			ftrace-size = <0x40000>;
+			pmsg-size = <0x40000>;
+		};
 	};
 
 	/* Простой GPIO-вибратор (COINDC), подтверждено в downstream:

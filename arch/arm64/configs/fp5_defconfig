@@ -523,3 +523,13 @@ CONFIG_DEBUG_FS=y
 CONFIG_PANIC_TIMEOUT=10
 # CONFIG_FTRACE is not set
 CONFIG_MEMTEST=y
+
+# Добавлено для M52: pstore/ramoops -- единственный способ увидеть хоть
+# что-то из ранней загрузки без UART. Адрес региона (0xf0b00000) взят
+# из downstream m52xq_eur_open_w00_r05.dts, уже проверенно рабочий в
+# параллельном Halium-проекте на этом же устройстве.
+CONFIG_PSTORE=y
+CONFIG_PSTORE_RAM=y
+CONFIG_PSTORE_CONSOLE=y
+CONFIG_PSTORE_PMSG=y
+CONFIG_PSTORE_FTRACE=y
