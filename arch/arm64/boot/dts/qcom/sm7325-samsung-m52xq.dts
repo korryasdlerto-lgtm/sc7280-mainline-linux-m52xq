@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Черновик device tree для Samsung Galaxy M52 5G (m52xq / SM-M526B).
+ * Основано на qcm6490-fairphone-fp5.dts (та же платформа Qualcomm "yupik",
+ * SM7325/QCM6490 семейство) как шаблон. НЕ ГОТОВО К ЗАГРУЗКЕ — черновик,
+ * начало работы 2026-08-02.
+ *
+ * Реальное железо M52 (найдено в downstream m52xq_eur_open_w00_r05.dts,
+ * LineageOS/android_kernel_samsung_sm7325, ветка lineage-23.2):
+ *   - Заряд/fuel gauge: SM5714 + PCA9468 (direct charging)
+ *     -> В MAINLINE ДРАЙВЕРА НЕТ (проверено grep по drivers/power/,
+ *        drivers/iio/ в этом дереве, 2026-08-02). БЛОКЕР для зарядки.
+ *   - PMIC-регуляторы: серия PM8008 (как и у FP5 — совпадает!)
+ *   - Экран: Novatek NT36672E, 1080x2400, до 144Гц
+ *     -> Драйвер ЕСТЬ: drivers/gpu/drm/panel/panel-novatek-nt36672e.c
+ *   - Тачскрин: Synaptics (synaptics_ts.ko) или STM (stm_ts.ko) в разных
+ *     вариантах платы
+ *     -> RMI4 (Synaptics) драйвер есть (drivers/input/rmi4/,
+ *        syna,rmi4-i2c / syna,rmi4-spi), НЕ подтверждена совместимость
+ *        протокола (Samsung иногда кастомизирует поверх той же микросхемы)
+ *     -> STM: stmfts.c/stmpe-ts.c есть, тоже не подтверждено
+ *   - Отпечаток: ET523 -> драйвера в mainline нет, отпечаток почти
+ *     никогда не мейнлайнят, для первой загрузки не нужен
+ *   - Аудио: Bolero + WCD938x -> драйвер ЕСТЬ: sound/soc/codecs/wcd938x.c
+ *   - Плата (BOARD_NAME из LineageOS BoardConfig.mk): SRPUF17B001
+ *
+ * TODO (по порядку, каждый пункт += компиляция и, когда будет UART,
+ * реальный тест):
+ *   1. Заменить &wifi секцию -- проверить, тот же ли класс WiFi-чипа что
+ *      и у FP5 (mainline-совместимый) или закрытый (как в downstream
+ *      qca_cld3_wlan.ko -- если так, WiFi тут тоже не заработает)
+ *   2. Заменить панель на nt36672e (drm/panel-novatek-nt36672e.c) с
+ *      реальными GPIO/supply из downstream DTS
+ *   3. Заменить touchscreen@0 на реальный чип этой платы/ревизии, с
+ *      реальными GPIO/supply
+ *   4. Решить вопрос заряда (SM5714/PCA9468) -- либо писать драйвер, либо
+ *      временно убрать всю charger-секцию (грузиться без управления
+ *      зарядом, только на текущем заряде батареи)
+ *   5. Проверить/заменить PMIC regulator voltage-таблицы -- взяты из FP5,
+ *      почти наверняка НЕ совпадают с реальными для M52 (другая плата)
+ *   6. Убрать всё камеро-специфичное (cci0/cci1 секции) -- под другие,
+ *      не M52, камеры -- заменить позже отдельно
+ *   7. Убрать vibrator@5a (awinic aw86927) -- проверить реальный чип
+ *      вибромотора M52
+ *
+ * Источники (проверено 2026-08-02):
+ *   https://github.com/sc7280-mainline/linux (форк, в котором лежит этот файл)
+ *   https://github.com/LineageOS/android_kernel_samsung_sm7325 (ветка lineage-23.2)
+ *   https://github.com/LineageOS/android_device_samsung_m52xq (ветка lineage-23.2)
+ *   https://github.com/LineageOS/android_device_samsung_sm7325-common
+ */
+
+/dts-v1/;
+
+#define PM7250B_SID 8
+#define PM7250B_SID1 9
+
+#include <dt-bindings/iio/qcom,spmi-adc7-pm7325.h>
+#include <dt-bindings/iio/qcom,spmi-adc7-pmk8350.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/media/video-interfaces.h>
+#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+#include "kodiak.dtsi"
+#include "pm7250b.dtsi"
+#include "pm7325.dtsi"
+#include "pm8350c.dtsi"
+#include "pmk8350.dtsi"
+
+/delete-node/ &rmtfs_mem;
+
+/ {
+	model = "Samsung Galaxy M52 5G";
+	compatible = "samsung,m52xq", "qcom,qcm6490";
+	chassis-type = "handset";
+
+	aliases {
+		serial0 = &uart5;
+		serial1 = &uart7;
+	};
+
+	/*
+	 * ЗАГЛУШКА: скопировано из FP5 без изменений. WCD938x подтверждён
+	 * (реальный чип M52), но конкретные GPIO/supply/micbias-напряжения
+	 * НЕ проверены под M52 -- нужно сверить с downstream DTS отдельно.
+	 */
+	/*
+	 * ВРЕМЕННО ОТКЛЮЧЕНО в этом черновике: узел ссылался на &wcd_reset_n,
+	 * &vreg_l18b/&vreg_l17b/&vreg_bob, &wcd_rx/&wcd_tx -- все они были в
+	 * секциях (&tlmm pinctrl, вторые regulators, &swr0/&swr1), которые
+	 * в этом урезанном черновике ещё не перенесены с FP5. Возвращать
+	 * вместе с этими секциями, когда дойдём до аудио.
+	 */
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		key-volume-up {
+			label = "Volume up";
+			gpios = <&pm7325_gpios 6 GPIO_ACTIVE_LOW>; /* TODO: проверить под M52 */
+			linux,code = <KEY_VOLUMEUP>;
+		};
+	};
+
+	reserved-memory {
+		/* TODO: полностью заменить на реальные регионы из downstream DTS M52 --
+		 * эти адреса/размеры взяты с FP5 и почти наверняка неверны */
+		rmtfs_mem: memory@f8500000 {
+			compatible = "qcom,rmtfs-mem";
+			reg = <0x0 0xf8500000 0x0 0x600000>;
+			no-map;
+
+			qcom,client-id = <1>;
+			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>, <QCOM_SCM_VMID_NAV>;
+		};
+	};
+};
+
+&apps_rsc {
+	/* ЗАГЛУШКА: regulator voltage-таблицы скопированы с FP5 без изменений.
+	 * ТРЕБУЕТ ПРОВЕРКИ под реальную плату M52 -- это один из самых
+	 * рискованных не проверенных участков (неверное питание может
+	 * повредить периферию). */
+	regulators-0 {
+		compatible = "qcom,pm7325-rpmh-regulators";
+		qcom,pmic-id = "b";
+
+		vreg_s1b: smps1 {
+			regulator-name = "vreg_s1b";
+			regulator-min-microvolt = <1840000>;
+			regulator-max-microvolt = <2040000>;
+		};
+
+		vreg_l7b: ldo7 {
+			regulator-name = "vreg_l7b";
+			regulator-min-microvolt = <2952000>;
+			regulator-max-microvolt = <2952000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l9b: ldo9 {
+			regulator-name = "vreg_l9b";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+/* TODO: заменить на реальную панель M52 (Novatek NT36672E) --
+ * drivers/gpu/drm/panel/panel-novatek-nt36672e.c уже есть в mainline,
+ * но compatible-строка/GPIO/supply конкретно под M52 нужно взять из
+ * downstream DTS. Ниже пока СКОПИРОВАНО с FP5 (Raydium панель) как
+ * placeholder -- заведомо неверно, грузиться с этим не будет.
+ */
+&mdss_dsi {
+	status = "okay";
+
+	panel@0 {
+		compatible = "novatek,nt36672e"; /* TODO: точная compatible-строка */
+		reg = <0>;
+		/* TODO: reset-gpios, vci/vddio/dvdd-supply, pinctrl -- всё из
+		 * downstream DTS M52 */
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+};
+
+&gpu {
+	status = "okay";
+};
+
+&gpu_zap_shader {
+	/* Тот же Adreno a660, что и у FP5 -- путь к прошивке скорее всего
+	 * можно оставить в этом же формате, но нужен реальный .mbn файл
+	 * под M52 (взять из vendor/firmware M52 или собрать из
+	 * зеркалированного /vendor/firmware, как это уже сделано в
+	 * параллельном Halium-проекте на этом же устройстве). */
+	firmware-name = "qcom/sm7325/m52xq/a660_zap.mbn";
+};
+
+&wifi {
+	/* TODO: реальный статус зависит от того, какой WiFi-чип на плате M52
+	 * и поддерживается ли он существующим mainline ath1x/ath12k
+	 * драйвером, или это закрытый чип (как qca_cld3_wlan.ko в
+	 * downstream/Halium-проекте на этом устройстве -- если да, mainline
+	 * тут тоже бессилен без открытой прошивки/драйвера). НЕ включено
+	 * (status оставлен закомментированным) до выяснения. */
+	// status = "okay";
+};
+
+&ufs_mem_hc {
+	status = "okay";
+	/* TODO: reset-gpios, vcc/vccq-supply под M52 */
+};
+
+&ufs_mem_phy {
+	status = "okay";
+};
+
+&uart5 {
+	status = "okay";
+};
+
+&pon_pwrkey {
+	status = "okay";
+};
+
+&pon_resin {
+	linux,code = <KEY_VOLUMEDOWN>;
+	status = "okay";
+};
+
+/*
+ * СОЗНАТЕЛЬНО ПРОПУЩЕНО в этом черновике (нужна отдельная работа):
+ *   - &camss / &cci0 / &cci1 -- камеры M52 совсем другие, весь блок с FP5 удалён
+ *   - зарядка (SM5714/PCA9468) -- драйвера в mainline нет, секции нет вовсе
+ *   - тачскрин -- нет уверенности в правильном chip/protocol, не включен
+ *   - vibrator -- чип не проверен, не включен
+ *   - NFC/Bluetooth -- не проверено отдельно, скопировано с FP5 в первом
+ *     черновике только частично (bluetooth ниже, требует проверки чипа)
+ */
