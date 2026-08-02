@@ -146,23 +146,129 @@
 			regulator-max-microvolt = <1304000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
+
+		/* Ниже -- добавлены для bluetooth (qcom,wcn6750-bt), значения
+		 * из БАЗОВОГО yupik-regulators.dtsi платформы, не с FP5. */
+		vreg_l19b: ldo19 {
+			regulator-name = "vreg_l19b";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <2000000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_s7b: smps7 {
+			regulator-name = "vreg_s7b";
+			regulator-min-microvolt = <535000>;
+			regulator-max-microvolt = <1120000>;
+		};
+
+		vreg_s8b: smps8 {
+			regulator-name = "vreg_s8b";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1500000>;
+		};
+	};
+
+	/* pm8350c_l7 -- питание touchscreen (tsp_io_ldo). Значение взято
+	 * из БАЗОВОГО yupik-regulators.dtsi (SoC-платформа, не FP5), т.е.
+	 * это не "скопировано с чужого телефона", а платформенный допуск --
+	 * см. ту же логику, что и для vreg_s1b/l9b выше. */
+	regulators-1 {
+		compatible = "qcom,pm8350c-rpmh-regulators";
+		qcom,pmic-id = "c";
+
+		vreg_l7c: ldo7 {
+			regulator-name = "vreg_l7c";
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3544000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* для bluetooth */
+		vreg_s1c: smps1 {
+			regulator-name = "vreg_s1c";
+			regulator-min-microvolt = <2190000>;
+			regulator-max-microvolt = <2210000>;
+		};
+
+		vreg_l11c: ldo11 {
+			regulator-name = "vreg_l11c";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <3544000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
 	};
 };
 
-/* TODO: заменить на реальную панель M52 (Novatek NT36672E) --
- * drivers/gpu/drm/panel/panel-novatek-nt36672e.c уже есть в mainline,
- * но compatible-строка/GPIO/supply конкретно под M52 нужно взять из
- * downstream DTS. Ниже пока СКОПИРОВАНО с FP5 (Raydium панель) как
- * placeholder -- заведомо неверно, грузиться с этим не будет.
+/*
+ * Bluetooth: тот же чип WCN6750, что и WiFi (combo-кристалл). В
+ * базовом yupik.dtsi (платформенный уровень, НЕ board-специфичный
+ * файл M52) уже есть готовый узел bt_wcn6750 с compatible =
+ * "qcom,wcn6750-bt" -- ТЕ ЖЕ пины, что и в mainline-конфиге FP5:
+ * BT_EN=85, SW_CTRL=86 (совпадение подтверждено напрямую, не
+ * предположение). Узел ниже -- перенос по образцу FP5 (тот же UART7),
+ * с этими подтверждёнными пинами.
+ */
+&uart7 {
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "qcom,wcn6750-bt";
+
+		enable-gpios = <&tlmm 85 GPIO_ACTIVE_HIGH>;
+		swctrl-gpios = <&tlmm 86 GPIO_ACTIVE_HIGH>;
+
+		vddio-supply = <&vreg_l19b>;
+		vddaon-supply = <&vreg_s7b>;
+		vddbtcxmx-supply = <&vreg_s7b>;
+		vddrfacmn-supply = <&vreg_s7b>;
+		vddrfa0p8-supply = <&vreg_s7b>;
+		vddrfa1p7-supply = <&vreg_s1b>;
+		vddrfa1p2-supply = <&vreg_s8b>;
+		vddrfa2p2-supply = <&vreg_s1c>;
+		vddasd-supply = <&vreg_l11c>;
+
+		max-speed = <3200000>;
+		/* TODO: pinctrl-0/pinctrl-names у FP5 ссылаются на
+		 * bluetooth_enable_default/sw_ctrl_default -- эти pinctrl-узлы
+		 * определены в FP5-специфичной &tlmm секции, которую мы в этот
+		 * черновик не переносили. Без pinctrl, вероятно, заработает
+		 * (gpiod задаст режим напрямую), но не "по всем правилам". */
+	};
+};
+
+/*
+ * Панель, ревизия r05: reset-gpio подтверждён -- во всех 5 вариантах
+ * nt36672e (60/90/120/144Hz, cphy) в downstream DTS одно и то же:
+ * TLMM pin 44, active-low.
+ *
+ * ПРОВЕРЕНО ГОРАЗДО ТВЁРЖЕ, ЧЕМ ОЖИДАЛОСЬ: сравнил hardcoded таймdescriptor
+ * mainline-драйвера drivers/gpu/drm/panel/panel-novatek-nt36672e.c
+ * (nt36672e_1080x2408_60hz: hfp=76 hpw=12 hbp=56, vfp=46 vpw=10 vbp=10)
+ * с реальными downstream-порчами M52 из фрагмента
+ * qcom,mdss_dsi_nt36672e_fhd_plus_60_video -- ЧИСЛА СОВПАДАЮТ ТОЧНО,
+ * ЦИФРА В ЦИФРУ. Дополнительно сравнил байт-код init-последовательности
+ * (qcom,mdss-dsi-on-command той же секции, 262 DCS-команды) с
+ * hardcoded init-функцией драйвера -- содержимое практически идентично
+ * (отличия только в оформлении page-switch макросов, не в данных).
+ * Вывод: mainline-драйвер, судя по всему, написан для ТОЧНО ТОЙ ЖЕ
+ * панели (или её ближайшего родственника), что стоит в M52 в 60Hz-
+ * режиме. compatible = "novatek,nt36672e" оставлен как есть, БЕЗ
+ * патчинга драйвера -- реальный шанс, что заработает из коробки.
+ * 90/120/144Hz-режимы для первого теста сознательно не рассматриваются
+ * (сложнее, отдельная DFPS-настройка, выше риск).
  */
 &mdss_dsi {
 	status = "okay";
 
 	panel@0 {
-		compatible = "novatek,nt36672e"; /* TODO: точная compatible-строка */
+		compatible = "novatek,nt36672e"; /* TODO: точная compatible-строка,
+			возможно понадобится доп. модельный суффикс */
 		reg = <0>;
-		/* TODO: reset-gpios, vci/vddio/dvdd-supply, pinctrl -- всё из
-		 * downstream DTS M52 */
+		reset-gpios = <&tlmm 44 GPIO_ACTIVE_LOW>; /* подтверждено downstream DTS */
+		/* TODO: vci/vddio/dvdd-supply -- в downstream заданы через
+		 * qcom,panel-supply-entries (0x33 записей, ссылается на
+		 * отдельный vreg-def блок, не разобран за это время) */
 
 		port {
 			panel_in: endpoint {
@@ -190,13 +296,72 @@
 };
 
 &wifi {
-	/* TODO: реальный статус зависит от того, какой WiFi-чип на плате M52
-	 * и поддерживается ли он существующим mainline ath1x/ath12k
-	 * драйвером, или это закрытый чип (как qca_cld3_wlan.ko в
-	 * downstream/Halium-проекте на этом устройстве -- если да, mainline
-	 * тут тоже бессилен без открытой прошивки/драйвера). НЕ включено
-	 * (status оставлен закомментированным) до выяснения. */
-	// status = "okay";
+	/* Чип подтверждён: downstream defconfig (lineage-m52xq_defconfig)
+	 * содержит CONFIG_QCA_CLD_WLAN_DYNAMIC_SINGLE_CHIP_NAME="qca6750" +
+	 * CONFIG_CNSS_QCA6750=y -- это Samsung-внутреннее имя для чипа
+	 * WCN6750, для которого в mainline уже есть зрелый драйвер ath11k
+	 * (compatible = "qcom,wcn6750-wifi", уже описан в базовом
+	 * kodiak.dtsi, который этот файл подключает). Точно тот же чип
+	 * использует Fairphone 5 на этой же платформе (см.
+	 * qcm6490-fairphone-fp5.dts: &wifi { qcom,calibration-variant =
+	 * "Fairphone_5"; status = "okay"; }).
+	 *
+	 * Board-специфичный калибровочный firmware-блоб для M52 уже
+	 * извлечён в параллельном Halium-проекте на этом устройстве:
+	 * /home/sasha/halium-backup/m52xq/proprietary/vendor/firmware/qca6750/bdwlan.elf
+	 * -- нужно положить в initramfs/rootfs как
+	 * /lib/firmware/ath11k/WCN6750/hw1.0/board-2.bin (или под именем,
+	 * которое ath11k подберёт по qcom,calibration-variant -- уточнить
+	 * точный механизм сопоставления перед первым тестом). Остальные
+	 * компоненты прошивки WCN6750 (wlanmdsp/m3/regdb) chip-общие, не
+	 * board-специфичные -- ожидаются из пакета linux-firmware.
+	 */
+	qcom,calibration-variant = "Samsung_M52";
+	status = "okay";
+};
+
+/*
+ * Тачскрин, ревизия платы r05 (та, что реально проверена в downstream
+ * DTS): Synaptics S3908 на i2c13 (QUP SE13), адрес 0x4b. Данные взяты
+ * напрямую из фрагмента@97 в m52xq_eur_open_w00_r05.dts + phandle-
+ * символов (fixed_regulator0, pm8350c_l7).
+ *
+ * ВАЖНАЯ ОГОВОРКА: downstream-драйвер здесь -- НЕ обычный протокол
+ * Synaptics RMI4, а Samsung-специфичная обвязка "sec_input"
+ * (свойства вроде sec,tclm_level/enable_settings_aot/support_fod
+ * это Samsung DeX/fingerprint-on-display функции, не часть
+ * стандартного RMI4). Firmware-блобы (s3908_m52xq_sdc.bin/boe.bin --
+ * два варианта под разных поставщиков панели, SDC/BOE) почти
+ * наверняка кастомные под этот Samsung-стек, а не эталонный RMI4-
+ * образ. Ниже -- узел под стандартный mainline-биндинг
+ * "syna,rmi4-i2c" (auto-discovery функций через PDT-скан, без
+ * захардкоженных rmi4-fXX подузлов). Скомпилируется и, вероятно,
+ * даже отзовётся на i2c-пробинге (адрес совпадает), но заговорит ли
+ * реально по стандартному RMI4-протоколу с этой прошивкой -- ЧИСТО
+ * не проверено, узнаваемо только на реальном железе.
+ *
+ * У другой ревизии платы (видно по firmware/tsp_stm/fts5cu56a_m52xq.bin
+ * в downstream-дереве) стоит STM FTS5CU56A вместо Synaptics -- какая
+ * именно ревизия в конкретном экземпляре устройства, неизвестно,
+ * нужно проверять на месте (например по board-id в загрузочных логах).
+ */
+&i2c13 {
+	status = "okay";
+
+	touchscreen@4b {
+		compatible = "syna,rmi4-i2c";
+		reg = <0x4b>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <81 IRQ_TYPE_LEVEL_LOW>; /* пин подтверждён (gpio81), полярность -- предположение */
+
+		vio-supply = <&vreg_l7c>; /* было tsp_io_ldo-supply, подтверждено по symbols */
+		/* TODO: tsp_avdd_ldo-supply в downstream -- GPIO-управляемый
+		 * fixed_regulator0 (TLMM pin 106, active-high), не PMIC LDO --
+		 * нужен отдельный regulator-fixed узел, сюда не перенесён. */
+	};
 };
 
 &ufs_mem_hc {
