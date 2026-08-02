@@ -116,6 +116,17 @@
 			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>, <QCOM_SCM_VMID_NAV>;
 		};
 	};
+
+	/* Простой GPIO-вибратор (COINDC), подтверждено в downstream:
+	 * dc_vibrator { compatible = "samsung,dc_vibrator";
+	 * dc_vib,gpio_en = <TLMM pin 62, flag 0>; }. Mainline-биндинг
+	 * "gpio-vibrator" -- уже используется на других устройствах
+	 * (например msm8916-samsung-gt58.dts) -- подходит напрямую, без
+	 * доп. драйвера. */
+	vibrator {
+		compatible = "gpio-vibrator";
+		enable-gpios = <&tlmm 62 GPIO_ACTIVE_HIGH>;
+	};
 };
 
 &apps_rsc {
