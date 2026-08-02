@@ -76,6 +76,13 @@
 	compatible = "samsung,m52xq", "qcom,qcm6490";
 	chassis-type = "handset";
 
+	/* Реальные значения из downstream m52xq_eur_open_w00_r05.dts.
+	 * Бутлоадер (или ранняя часть цепочки) может сверять их с
+	 * hardware-фьюзами SoC перед стартом ядра -- не было в черновике
+	 * до этого момента, возможная причина отказа принять образ. */
+	qcom,msm-id = <0x1db 0x10000 0x203 0x10000>;
+	qcom,board-id = <0x22 0x5>;
+
 	aliases {
 		serial0 = &uart5;
 		serial1 = &uart7;
