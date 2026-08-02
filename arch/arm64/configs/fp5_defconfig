@@ -533,3 +533,13 @@ CONFIG_PSTORE_RAM=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_PMSG=y
 CONFIG_PSTORE_FTRACE=y
+
+# Найдено в записях параллельного Halium-проекта (23 июня, сессия
+# первого запуска Ubuntu Touch): CONFIG_INIT_STACK_ALL_ZERO (дефолт
+# Kconfig при сборке Clang'ом, если компилятор поддерживает) ломал
+# код Samsung-специфичных downstream-драйверов на этом устройстве --
+# фикс тогда был вернуть на CONFIG_INIT_STACK_NONE. Мы собираем тоже
+# Clang'ом (LLVM=1), то есть INIT_STACK_ALL_ZERO сейчас включён у нас
+# по умолчанию, никогда явно не отключался. Возможная причина того,
+# что ядро не проходит даже самый ранний этап загрузки.
+CONFIG_INIT_STACK_NONE=y
