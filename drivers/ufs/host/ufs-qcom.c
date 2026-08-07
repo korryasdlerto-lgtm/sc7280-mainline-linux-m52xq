@@ -2954,6 +2954,8 @@ static int ufs_qcom_probe(struct platform_device *pdev)
 	const struct ufs_hba_variant_ops *vops;
 	const struct ufs_qcom_drvdata *drvdata = device_get_match_data(dev);
 
+	pr_err("CP60-ufs-probe-entered\n");
+
 	if (drvdata && drvdata->vops)
 		vops = drvdata->vops;
 	else
@@ -2974,9 +2976,12 @@ static int ufs_qcom_probe(struct platform_device *pdev)
 
 	/* Perform generic probe */
 	err = ufshcd_pltfrm_init(pdev, vops);
-	if (err)
+	if (err) {
+		pr_err("CP61-ufs-pltfrm-init-failed-err=%d\n", err);
 		return dev_err_probe(dev, err, "ufshcd_pltfrm_init() failed\n");
+	}
 
+	pr_err("CP62-ufs-probe-success\n");
 	return 0;
 }
 

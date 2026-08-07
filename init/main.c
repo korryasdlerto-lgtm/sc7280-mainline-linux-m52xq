@@ -832,6 +832,37 @@ static inline void initcall_debug_enable(void)
 }
 #endif
 
+#include <linux/hrtimer.h>
+
+static DEFINE_PER_CPU(struct hrtimer, m52_heartbeat_timer);
+static DEFINE_PER_CPU(unsigned int, m52_heartbeat_count);
+
+static enum hrtimer_restart m52_heartbeat_fn(struct hrtimer *timer)
+{
+	unsigned int *cnt = this_cpu_ptr(&m52_heartbeat_count);
+
+	(*cnt)++;
+	pr_err("HEARTBEAT-CPU%d-count=%u-jiffies=%lu\n",
+	       smp_processor_id(), *cnt, jiffies);
+	hrtimer_forward_now(timer, ms_to_ktime(10000));
+	return HRTIMER_RESTART;
+}
+
+static void m52_heartbeat_start_on_cpu(void *unused)
+{
+	struct hrtimer *t = this_cpu_ptr(&m52_heartbeat_timer);
+
+	hrtimer_setup(t, m52_heartbeat_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_HARD);
+	hrtimer_start(t, ms_to_ktime(10000), HRTIMER_MODE_REL_PINNED_HARD);
+}
+
+static int __init m52_heartbeat_init(void)
+{
+	on_each_cpu(m52_heartbeat_start_on_cpu, NULL, 1);
+	return 0;
+}
+late_initcall(m52_heartbeat_init);
+
 #ifdef CONFIG_RANDOMIZE_KSTACK_OFFSET
 DEFINE_STATIC_KEY_MAYBE_RO(CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT,
 			   randomize_kstack_offset);
@@ -1450,6 +1481,7 @@ static void __init do_initcall_level(int level, char *command_line)
 		   NULL, ignore_unknown_bootoption);
 
 	do_trace_initcall_level(initcall_level_names[level]);
+
 	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
 		do_one_initcall(initcall_from_entry(fn));
 }

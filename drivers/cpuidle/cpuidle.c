@@ -37,7 +37,7 @@ DEFINE_MUTEX(cpuidle_lock);
 LIST_HEAD(cpuidle_detected_devices);
 
 static int enabled_devices;
-static int off __read_mostly;
+static int off __read_mostly = 1;
 static int initialized __read_mostly;
 
 int cpuidle_disabled(void)

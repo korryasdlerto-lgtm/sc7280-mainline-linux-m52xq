@@ -9691,8 +9691,16 @@ out:
 static int ufshcd_init_hba_vreg(struct ufs_hba *hba)
 {
 	struct ufs_vreg_info *info = &hba->vreg_info;
+	int err = ufshcd_get_vreg(hba->dev, info->vdd_hba);
 
-	return ufshcd_get_vreg(hba->dev, info->vdd_hba);
+	if (err) {
+		dev_warn(hba->dev,
+			 "vdd-hba regulator unavailable (err=%d), assuming already enabled by bootloader\n",
+			 err);
+		info->vdd_hba = NULL;
+		return 0;
+	}
+	return 0;
 }
 
 static int ufshcd_setup_clocks(struct ufs_hba *hba, bool on)

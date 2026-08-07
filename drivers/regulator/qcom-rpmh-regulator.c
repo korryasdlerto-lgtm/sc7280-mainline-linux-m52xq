@@ -445,6 +445,46 @@ static const struct regulator_ops rpmh_regulator_xob_ops = {
  *
  * Return: 0 on success, or a negative error number on failure
  */
+/*
+ * Downstream devicetree nodes name regulators like "regulator-pm7325-l9"
+ * instead of upstream's "ldo9"/"smps1"/"bob". Recognize the downstream
+ * suffix ("-l9", "-s1", "-bob") as an alias so we don't have to rename
+ * nodes in the (bootloader-validated) vendor devicetree blob.
+ */
+static bool rpmh_vreg_name_matches(struct device_node *node, const char *mainline_name)
+{
+	const char *node_name = node->name;
+	const char *dash;
+	char type_ch;
+	const char *num_str;
+
+	if (of_node_name_eq(node, mainline_name))
+		return true;
+
+	dash = strrchr(node_name, '-');
+	if (!dash || !dash[1])
+		return false;
+	dash++;
+
+	if (!strcmp(mainline_name, "bob"))
+		return !strcmp(dash, "bob");
+
+	if (!strncmp(mainline_name, "ldo", 3)) {
+		type_ch = 'l';
+		num_str = mainline_name + 3;
+	} else if (!strncmp(mainline_name, "smps", 4)) {
+		type_ch = 's';
+		num_str = mainline_name + 4;
+	} else {
+		return false;
+	}
+
+	if (dash[0] != type_ch)
+		return false;
+
+	return !strcmp(dash + 1, num_str);
+}
+
 static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 			struct device_node *node, const char *pmic_id,
 			const struct rpmh_vreg_init_data *pmic_rpmh_data)
@@ -460,7 +500,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 	vreg->dev = dev;
 
 	for (rpmh_data = pmic_rpmh_data; rpmh_data->name; rpmh_data++)
-		if (of_node_name_eq(node, rpmh_data->name))
+		if (rpmh_vreg_name_matches(node, rpmh_data->name))
 			break;
 
 	if (!rpmh_data->name) {

@@ -256,6 +256,8 @@ static int pmic_spmi_probe(struct spmi_device *sdev)
 	struct qcom_spmi_dev *ctx;
 	int ret;
 
+	pr_err("CP80-pmic_spmi_probe-ENTER-usid=%d\n", sdev->usid);
+
 	regmap = devm_regmap_init_spmi_ext(sdev, &spmi_regmap_config);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
@@ -269,17 +271,23 @@ static int pmic_spmi_probe(struct spmi_device *sdev)
 	/* Only the first slave id for a PMIC contains this information */
 	if (sdev->usid % ctx->num_usids == 0) {
 		ret = pmic_spmi_load_revid(regmap, &sdev->dev, &ctx->pmic);
-		if (ret < 0)
+		if (ret < 0) {
+			pr_err("CP81-load_revid-FAILED-usid=%d-ret=%d\n", sdev->usid, ret);
 			return ret;
+		}
 	} else {
 		ret = pmic_spmi_get_base_revid(sdev, ctx);
-		if (ret)
+		if (ret) {
+			pr_err("CP82-get_base_revid-FAILED-usid=%d-ret=%d\n", sdev->usid, ret);
 			return ret;
+		}
 	}
 
 	mutex_lock(&pmic_spmi_revid_lock);
 	spmi_device_set_drvdata(sdev, ctx);
 	mutex_unlock(&pmic_spmi_revid_lock);
+
+	pr_err("CP83-pmic_spmi_probe-SUCCESS-usid=%d\n", sdev->usid);
 
 	return devm_of_platform_populate(&sdev->dev);
 }

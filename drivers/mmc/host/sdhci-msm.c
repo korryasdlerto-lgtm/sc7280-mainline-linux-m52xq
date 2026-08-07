@@ -2655,9 +2655,11 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	const struct sdhci_msm_variant_info *var_info;
 	struct device_node *node = pdev->dev.of_node;
 
+	pr_err("SDHCITRACE-cpu%d-A-pltfm_init\n", smp_processor_id());
 	host = sdhci_pltfm_init(pdev, &sdhci_msm_pdata, sizeof(*msm_host));
 	if (IS_ERR(host))
 		return PTR_ERR(host);
+	pr_err("SDHCITRACE-cpu%d-B-after-pltfm_init\n", smp_processor_id());
 
 	host->sdma_boundary = 0;
 	pltfm_host = sdhci_priv(host);
@@ -2665,9 +2667,11 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	msm_host->mmc = host->mmc;
 	msm_host->pdev = pdev;
 
+	pr_err("SDHCITRACE-cpu%d-C-before-mmc_of_parse\n", smp_processor_id());
 	ret = mmc_of_parse(host->mmc);
 	if (ret)
 		return ret;
+	pr_err("SDHCITRACE-cpu%d-D-after-mmc_of_parse\n", smp_processor_id());
 
 	/*
 	 * Based on the compatible string, load the required msm host info from
@@ -2687,23 +2691,29 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 
 	msm_host->saved_tuning_phase = INVALID_TUNING_PHASE;
 
+	pr_err("SDHCITRACE-cpu%d-E-before-gcc_reset\n", smp_processor_id());
 	ret = sdhci_msm_gcc_reset(&pdev->dev, host);
 	if (ret)
 		return ret;
+	pr_err("SDHCITRACE-cpu%d-F-after-gcc_reset\n", smp_processor_id());
 
 	/* Setup SDCC bus voter clock. */
 	msm_host->bus_clk = devm_clk_get(&pdev->dev, "bus");
 	if (!IS_ERR(msm_host->bus_clk)) {
 		/* Vote for max. clk rate for max. performance */
+		pr_err("SDHCITRACE-cpu%d-G-before-bus_clk_set_rate\n", smp_processor_id());
 		ret = clk_set_rate(msm_host->bus_clk, INT_MAX);
 		if (ret)
 			return ret;
+		pr_err("SDHCITRACE-cpu%d-H-before-bus_clk_prepare_enable\n", smp_processor_id());
 		ret = clk_prepare_enable(msm_host->bus_clk);
 		if (ret)
 			return ret;
+		pr_err("SDHCITRACE-cpu%d-I-after-bus_clk_prepare_enable\n", smp_processor_id());
 	}
 
 	/* Setup main peripheral bus clock */
+	pr_err("SDHCITRACE-cpu%d-J-before-iface-clk-get\n", smp_processor_id());
 	clk = devm_clk_get(&pdev->dev, "iface");
 	if (IS_ERR(clk)) {
 		ret = PTR_ERR(clk);
@@ -2711,6 +2721,7 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		goto bus_clk_disable;
 	}
 	msm_host->bulk_clks[1].clk = clk;
+	pr_err("SDHCITRACE-cpu%d-K-after-iface-clk-get\n", smp_processor_id());
 
 	/* Setup SDC MMC clock */
 	clk = devm_clk_get(&pdev->dev, "core");
@@ -2720,6 +2731,7 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		goto bus_clk_disable;
 	}
 	msm_host->bulk_clks[0].clk = clk;
+	pr_err("SDHCITRACE-cpu%d-L-after-core-clk-get\n", smp_processor_id());
 
 	 /* Check for optional interconnect paths */
 	ret = dev_pm_opp_of_find_icc_paths(&pdev->dev, NULL);
@@ -2752,10 +2764,12 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		clk = NULL;
 	msm_host->bulk_clks[3].clk = clk;
 
+	pr_err("SDHCITRACE-cpu%d-M-before-clk_bulk_prepare_enable\n", smp_processor_id());
 	ret = clk_bulk_prepare_enable(ARRAY_SIZE(msm_host->bulk_clks),
 				      msm_host->bulk_clks);
 	if (ret)
 		goto bus_clk_disable;
+	pr_err("SDHCITRACE-cpu%d-N-after-clk_bulk_prepare_enable\n", smp_processor_id());
 
 	/*
 	 * xo clock is needed for FLL feature of cm_dll.
@@ -2790,7 +2804,9 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 				msm_offset->core_hc_mode);
 	}
 
+	pr_err("SDHCITRACE-cpu%d-O-before-first-mmio-read\n", smp_processor_id());
 	host_version = readw_relaxed((host->ioaddr + SDHCI_HOST_VERSION));
+	pr_err("SDHCITRACE-cpu%d-P-after-first-mmio-read-val=0x%x\n", smp_processor_id(), host_version);
 	dev_dbg(&pdev->dev, "Host Version: 0x%x Vendor Version 0x%x\n",
 		host_version, ((host_version & SDHCI_VENDOR_VER_MASK) >>
 			       SDHCI_VENDOR_VER_SHIFT));

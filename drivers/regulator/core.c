@@ -6829,7 +6829,7 @@ unlock:
 	return 0;
 }
 
-static bool regulator_ignore_unused;
+static bool regulator_ignore_unused = true;
 static int __init regulator_ignore_unused_setup(char *__unused)
 {
 	regulator_ignore_unused = true;
