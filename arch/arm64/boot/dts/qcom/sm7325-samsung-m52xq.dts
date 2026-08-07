@@ -63,7 +63,11 @@
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/sound/qcom,q6asm.h>
 #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
-#include "kodiak.dtsi"
+/* sm7325.dtsi = kodiak.dtsi + правильный qcom,kryo670 для CPU (наш SoC --
+ * настоящий SM7325, не QCM6490; взято из sm7325-nothing-spacewar.dts,
+ * реального рабочего mainline-порта на том же чипе). Раньше подключали
+ * kodiak.dtsi напрямую и теряли эту правку. */
+#include "sm7325.dtsi"
 #include "pm7250b.dtsi"
 #include "pm7325.dtsi"
 #include "pm8350c.dtsi"
@@ -73,7 +77,13 @@
 
 / {
 	model = "Samsung Galaxy M52 5G";
-	compatible = "samsung,m52xq", "qcom,qcm6490";
+	/* Реальный M52 (downstream m52xq_eur_open_w00_r05.dts) идентифицирует себя
+	 * как "qcom,yupik-idp"/"qcom,yupik"/"qcom,idp" -- это референс-платформа
+	 * Qualcomm для SM7325 (в mainline пока нет yupik.dtsi, ближайшая доступная
+	 * база -- kodiak.dtsi для QCM6490). Добавляем реальные строки в конец
+	 * списка -- возможно, бутлоадер matchит платформу по этой строке
+	 * отдельно от qcom,msm-id/qcom,board-id. */
+	compatible = "samsung,m52xq", "qcom,qcm6490", "qcom,yupik-idp", "qcom,yupik", "qcom,idp";
 	chassis-type = "handset";
 
 	/* Реальные значения из downstream m52xq_eur_open_w00_r05.dts.
@@ -81,7 +91,7 @@
 	 * hardware-фьюзами SoC перед стартом ядра -- не было в черновике
 	 * до этого момента, возможная причина отказа принять образ. */
 	qcom,msm-id = <0x1db 0x10000 0x203 0x10000>;
-	qcom,board-id = <0x22 0x5>;
+	qcom,board-id = <0x00 0x00>;
 
 	aliases {
 		serial0 = &uart5;
@@ -112,8 +122,91 @@
 	};
 
 	reserved-memory {
-		/* TODO: полностью заменить на реальные регионы из downstream DTS M52 --
-		 * эти адреса/размеры взяты с FP5 и почти наверняка неверны */
+		/* Ниже -- исправление реальной карты памяти. Базовый kodiak.dtsi
+		 * (FP5/QCM6490) унаследовал адреса, которые сверены с настоящим
+		 * SM7325 ("shima") в halium-13/kernel/samsung/sm7325/arch/arm64/
+		 * boot/dts/vendor/qcom/shima.dtsi -- и оказались НЕВЕРНЫМИ для
+		 * нескольких регионов (2026-08-03, после того как выяснилось, что
+		 * mainline-ядро с нашим DTB мгновенно валит устройство в Download
+		 * Mode, а с чужим/stock DTB -- нормально доходит до поздних
+		 * initcalls). Если оставить как в kodiak.dtsi, ядро при старте
+		 * резервирует память НЕ там, где реально лежит прошивка
+        	 * (video/CVP/CDSP/modem), и либо затирает её, либо не защищает
+		 * от собственных аллокаций -- мгновенный катастрофический сбой
+		 * без единого сообщения в консоль.
+		 *
+		 * Исправлены (сравнение с shima.dtsi):
+		 *  - reserved_xbl_uefi_log: kodiak начинается на 0x4000 позже
+		 *    реального (недорезервирует хвост XBL/UEFI лога)
+		 *  - wlan_fw_mem: kodiak даёt только 12MB, реально это CDSP
+		 *    secure heap размером 70MB (0x80c00000..0x85200000) --
+		 *    недорезервировано на 58MB!
+		 *  - video_mem: kodiak указывает на 0x8b200000, а реальный
+		 *    видео-кодек firmware -- на 0x85d00000 (расхождение 85MB,
+		 *    да ещё и старый адрес попадает ВНУТРЬ реального wlan-региона)
+		 *  - mpss_mem: kodiak на 6MB короче реального (модем+wlan вместе
+		 *    занимают 256MB, не 246MB)
+		 *
+		 * Добавлены регионы, которых у kodiak.dtsi нет вообще (то есть
+		 * ядро считало их свободной RAM): camera, cvp, отдельный wlan,
+		 * ipa_gsi, removed_region, trustedvm (Gunyah), qrtr_shbuf,
+		 * chan0/1_shbuf.
+		 *
+		 * Переопределения существующих меток kodiak.dtsi (&reserved_xbl_uefi_log,
+		 * &wlan_fw_mem, &video_mem, &mpss_mem) вынесены на верхний уровень файла
+		 * после закрытия корневого узла -- &label{} нельзя использовать
+		 * вложенно внутри другого узла.
+		 */
+		pil_camera_mem: camera@85800000 {
+			no-map;
+			reg = <0x0 0x85800000 0x0 0x500000>;
+		};
+
+		pil_cvp_mem: cvp@86200000 {
+			no-map;
+			reg = <0x0 0x86200000 0x0 0x500000>;
+		};
+
+		pil_wlan_mem: wlan@8ad00000 {
+			no-map;
+			reg = <0x0 0x8ad00000 0x0 0xa00000>;
+		};
+
+		pil_ipa_gsi_mem: ipa_gsi@8b710000 {
+			no-map;
+			reg = <0x0 0x8b710000 0x0 0xa000>;
+		};
+
+		removed_mem: removed_region@c0000000 {
+			no-map;
+			reg = <0x0 0xc0000000 0x0 0x5100000>;
+		};
+
+		pil_trustedvm_mem: pil_trustedvm_region@d0800000 {
+			no-map;
+			reg = <0x0 0xd0800000 0x0 0x76f7000>;
+		};
+
+		qrtr_shbuf: qrtr-shmem {
+			no-map;
+			reg = <0x0 0xd7ef7000 0x0 0x9000>;
+		};
+
+		chan0_shbuf: neuron_block@0 {
+			no-map;
+			reg = <0x0 0xd7f00000 0x0 0x80000>;
+		};
+
+		chan1_shbuf: neuron_block@1 {
+			no-map;
+			reg = <0x0 0xd7f80000 0x0 0x80000>;
+		};
+
+		/* TODO: rmtfs_mem всё ещё взят с FP5 и не сверен с shima.dtsi/
+		 * реальным M52 -- в базовом shima.dtsi/kodiak.dtsi такого
+		 * региона вообще нет как отдельного (видимо, board-специфичный
+		 * для FP5). Модем RF-калибровка, не блокер для первого старта
+		 * ядра, но требует проверки до включения модема. */
 		rmtfs_mem: memory@f8500000 {
 			compatible = "qcom,rmtfs-mem";
 			reg = <0x0 0xf8500000 0x0 0x600000>;
@@ -123,17 +216,21 @@
 			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>, <QCOM_SCM_VMID_NAV>;
 		};
 
-		/* Адрес и размеры -- РЕАЛЬНЫЕ, из downstream
-		 * m52xq_eur_open_w00_r05.dts (ramoops@F0B00000), не с FP5.
-		 * Фиксированный HW-карвaут, должен быть одинаковым независимо
-		 * от того, какая ОС на нём работает. */
-		ramoops@f0b00000 {
+		/* ВРЕМЕННО для диагностики: собственный carveout, отдельный от
+		 * стокового ramoops@f0b00000 (тот общий с TWRP/stock -- TWRP
+		 * при своей загрузке немедленно затирает его собственным
+		 * console-логом, поэтому мы никогда не видим, что успело
+		 * написать наше ядро, если оно вообще стартовало).
+		 * f4000000 выбран в чистом промежутке между стоковым
+		 * ramoops (f0b00000-f0c00000) и rmtfs_mem (f8500000+),
+		 * не пересекается ни с чем из kodiak.dtsi/reserved-memory. */
+		ramoops@fa800000 {
 			compatible = "ramoops";
-			reg = <0x0 0xf0b00000 0x0 0x100000>;
+			reg = <0x0 0xfa800000 0x0 0x200000>;
 			record-size = <0x40000>;
-			console-size = <0x40000>;
-			ftrace-size = <0x40000>;
-			pmsg-size = <0x40000>;
+			console-size = <0x180000>;
+			ftrace-size = <0x20000>;
+			pmsg-size = <0x20000>;
 		};
 	};
 
@@ -147,6 +244,24 @@
 		compatible = "gpio-vibrator";
 		enable-gpios = <&tlmm 62 GPIO_ACTIVE_HIGH>;
 	};
+};
+
+/* Исправление реальной карты памяти -- см. комментарий в reserved-memory
+ * выше. Сверено с shima.dtsi (настоящий SM7325), 2026-08-03. */
+&reserved_xbl_uefi_log {
+	reg = <0x0 0x80880000 0x0 0x14000>;
+};
+
+&wlan_fw_mem {
+	reg = <0x0 0x80c00000 0x0 0x4600000>;
+};
+
+&video_mem {
+	reg = <0x0 0x85d00000 0x0 0x500000>;
+};
+
+&mpss_mem {
+	reg = <0x0 0x8b800000 0x0 0x10000000>;
 };
 
 &apps_rsc {
@@ -175,6 +290,16 @@
 			regulator-name = "vreg_l9b";
 			regulator-min-microvolt = <1200000>;
 			regulator-max-microvolt = <1304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* Добавлено для &ufs_mem_phy (vdda-pll-supply) -- этого узла
+		 * не было вообще, из-за чего PHY стоял без питания. Значения
+		 * 1-в-1 с qcm6490-fairphone-fp5.dts. */
+		vreg_l6b: ldo6 {
+			regulator-name = "vreg_l6b";
+			regulator-min-microvolt = <1140000>;
+			regulator-max-microvolt = <1260000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
@@ -212,6 +337,15 @@
 			regulator-name = "vreg_l7c";
 			regulator-min-microvolt = <3000000>;
 			regulator-max-microvolt = <3544000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* Добавлено для &ufs_mem_phy (vdda-phy-supply) -- как и l6b
+		 * выше, этого узла не было вообще. 1-в-1 с FP5. */
+		vreg_l10c: ldo10 {
+			regulator-name = "vreg_l10c";
+			regulator-min-microvolt = <720000>;
+			regulator-max-microvolt = <1050000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
@@ -396,11 +530,27 @@
 };
 
 &ufs_mem_hc {
+	/* Взято 1-в-1 с qcm6490-fairphone-fp5.dts и sm7325-nothing-spacewar.dts
+	 * (реальный SM7325!) -- одинаковое в обоих, включая номер GPIO. UFS
+	 * держит весь наш rootfs; без vcc/vccq-supply и reset-gpios контроллер
+	 * может зависнуть при пробе -- раньше пропускали эту секцию вообще. */
+	reset-gpios = <&tlmm 175 GPIO_ACTIVE_LOW>;
+
+	vcc-supply = <&vreg_l7b>;
+	vcc-max-microamp = <800000>;
+	vccq-supply = <&vreg_l9b>;
+	vccq-max-microamp = <900000>;
+
 	status = "okay";
-	/* TODO: reset-gpios, vcc/vccq-supply под M52 */
 };
 
 &ufs_mem_phy {
+	/* Взято 1-в-1 с qcm6490-fairphone-fp5.dts -- без этого PHY стоял
+	 * совсем без питания (vreg_l6b/vreg_l10c добавлены выше в apps_rsc
+	 * специально для этого). */
+	vdda-phy-supply = <&vreg_l10c>;
+	vdda-pll-supply = <&vreg_l6b>;
+
 	status = "okay";
 };
 
