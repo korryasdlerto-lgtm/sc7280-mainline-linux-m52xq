@@ -520,6 +520,8 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
 		return ret;
 	}
 
+	pr_err("PHYGEARTRACE-mode=%d-phy_gear=%d-hw_ver_major=0x%x\n",
+	       mode, host->phy_gear, host->hw_ver.major);
 	ret = phy_set_mode_ext(phy, mode, host->phy_gear);
 	if (ret)
 		goto out_disable_phy;
@@ -531,6 +533,7 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
 			__func__, ret);
 		goto out_disable_phy;
 	}
+	pr_err("PHYGEARTRACE-after-phy_power_on-ret=%d\n", ret);
 
 	ret = phy_calibrate(phy);
 	if (ret) {
@@ -705,6 +708,47 @@ cfg_timers:
 	return 0;
 }
 
+/*
+ * ufs_qcom_bypass_cfgready_signal - M52XQ HSG4 CFGREADY sampling errata
+ * workaround (see BIT_TX_EOB_COND comment in ufs-qcom.h). Ported from
+ * downstream ufs-qcom.c; downstream gates this behind an optional DT
+ * flag ("bypass-g4-cfgready") that our extracted DTB doesn't set, but
+ * the symptom it fixes (link comes up then immediately drops with a
+ * PHY adapter layer generic error / LINERESET right after
+ * DME_LINK_STARTUP) matches exactly what we hit in HS Gear4, so apply
+ * it unconditionally rather than gating on the missing property.
+ */
+static int ufs_qcom_bypass_cfgready_signal(struct ufs_hba *hba)
+{
+	int err;
+	u32 pa_vs_config_reg1;
+	u32 pa_vs_config_reg2;
+	u32 mask;
+
+	err = ufshcd_dme_get(hba, UIC_ARG_MIB(PA_VS_CONFIG_REG1),
+			     &pa_vs_config_reg1);
+	if (err)
+		return err;
+
+	err = ufshcd_dme_set(hba, UIC_ARG_MIB(PA_VS_CONFIG_REG1),
+			     (pa_vs_config_reg1 | BIT_TX_EOB_COND));
+	if (err)
+		return err;
+
+	err = ufshcd_dme_get(hba, UIC_ARG_MIB(PA_VS_CONFIG_REG2),
+			     &pa_vs_config_reg2);
+	if (err)
+		return err;
+
+	mask = (BIT_RX_EOB_COND | BIT_LINKCFG_WAIT_LL1_RX_CFG_RDY |
+		H8_ENTER_COND_MASK);
+	pa_vs_config_reg2 = (pa_vs_config_reg2 & ~mask) |
+			    (0x2 << H8_ENTER_COND_OFFSET);
+
+	return ufshcd_dme_set(hba, UIC_ARG_MIB(PA_VS_CONFIG_REG2),
+			      pa_vs_config_reg2);
+}
+
 static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 					enum ufs_notify_change_status status)
 {
@@ -729,6 +773,13 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 		 * completed.
 		 */
 		err = ufshcd_disable_host_tx_lcc(hba);
+		if (err)
+			break;
+
+		err = ufs_qcom_bypass_cfgready_signal(hba);
+		if (err)
+			dev_err(hba->dev, "%s: bypass_cfgready_signal failed %d\n",
+				__func__, err);
 
 		break;
 	default:
@@ -1307,6 +1358,31 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 
 	if (drvdata && drvdata->quirks)
 		hba->quirks |= drvdata->quirks;
+
+	/*
+	 * M52XQ DIAGNOSTIC: the real android_kernel_samsung_sm7325 driver
+	 * unconditionally sets an equivalent "crypto is broken" quirk here,
+	 * with the comment "inline crypto is currently broken with
+	 * ufs-qcom... there are likely to be other issues that will need
+	 * to be addressed too". ufshcd_hba_start() sets CRYPTO_GENERAL_ENABLE
+	 * alongside CONTROLLER_ENABLE on every single HCE cycle (before
+	 * link_startup even begins) whenever UFSHCD_CAP_CRYPTO got
+	 * detected - untested hypothesis that this destabilizes the
+	 * controller if the ICE path isn't fully ready that early.
+	 */
+	hba->quirks |= UFSHCD_QUIRK_BROKEN_CRYPTO_ENABLE;
+
+	/*
+	 * M52XQ DIAGNOSTIC: ufshcd_is_auto_hibern8_supported() checks a HW
+	 * capability bit (MASK_AUTO_HIBERN8_SUPPORT), independent of our own
+	 * ufs_qcom_set_caps() list - so Auto-H8 with the 150ms default idle
+	 * timer may already be active on this board even though we never
+	 * asked for it. That's plenty of idle time between our ~1.25s-spaced
+	 * NOP OUT retries for the controller to autonomously hibernate and
+	 * potentially fail to exit cleanly, which could look exactly like
+	 * our LINERESET storm. Untested hypothesis - disable it outright.
+	 */
+	hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
 }
 
 static void ufs_qcom_set_phy_gear(struct ufs_qcom_host *host)
@@ -1515,11 +1591,13 @@ static int ufs_qcom_icc_init(struct ufs_qcom_host *host)
 	int ret;
 
 	host->icc_ddr = devm_of_icc_get(dev, "ufs-ddr");
+	pr_err("UFSTRACE-icc-ufsddr-err=%ld\n", PTR_ERR_OR_ZERO(host->icc_ddr));
 	if (IS_ERR(host->icc_ddr))
 		return dev_err_probe(dev, PTR_ERR(host->icc_ddr),
 				    "failed to acquire interconnect path\n");
 
 	host->icc_cpu = devm_of_icc_get(dev, "cpu-ufs");
+	pr_err("UFSTRACE-icc-cpuufs-err=%ld\n", PTR_ERR_OR_ZERO(host->icc_cpu));
 	if (IS_ERR(host->icc_cpu))
 		return dev_err_probe(dev, PTR_ERR(host->icc_cpu),
 				    "failed to acquire interconnect path\n");
@@ -1581,14 +1659,19 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 		dev_warn(dev, "Failed to register reset controller\n");
 
 	if (!has_acpi_companion(dev)) {
+		pr_err("UFSTRACE-before-phy_get\n");
 		host->generic_phy = devm_phy_get(dev, "ufsphy");
+		pr_err("UFSTRACE-after-phy_get-err=%ld\n",
+		       IS_ERR(host->generic_phy) ? PTR_ERR(host->generic_phy) : 0);
 		if (IS_ERR(host->generic_phy)) {
 			err = dev_err_probe(dev, PTR_ERR(host->generic_phy), "Failed to get PHY\n");
 			goto out_variant_clear;
 		}
 	}
 
+	pr_err("UFSTRACE-before-icc_init\n");
 	err = ufs_qcom_icc_init(host);
+	pr_err("UFSTRACE-after-icc_init-err=%d\n", err);
 	if (err)
 		goto out_variant_clear;
 
@@ -2200,7 +2283,24 @@ static void ufs_qcom_dump_dbg_regs(struct ufs_hba *hba)
 		/* voluntarily yield the CPU as we are dumping too much data */
 		ufshcd_dump_regs(hba, UFS_TEST_BUS, 4, "UFS_TEST_BUS ");
 		cond_resched();
-		ufs_qcom_dump_testbus(hba);
+		/*
+		 * M52XQ DIAGNOSTIC: this 256-entry TSTBUS_UNIPRO dump alone
+		 * eats most of the pstore ring buffer capacity if it fires
+		 * on every single error event during the LINERESET storm.
+		 * Limit it to exactly once for the whole boot, so we get
+		 * one clean, complete raw hardware snapshot of the PA/UniPro
+		 * internal state right at the very first LINERESET, without
+		 * flooding the buffer on the following ~500+ repeats.
+		 */
+		{
+			static bool dumped_once;
+
+			if (!dumped_once) {
+				dumped_once = true;
+				pr_err("TESTBUSTRACE-dumping-once\n");
+				ufs_qcom_dump_testbus(hba);
+			}
+		}
 	}
 }
 
@@ -2217,6 +2317,19 @@ static int ufs_qcom_device_reset(struct ufs_hba *hba)
 	/* reset gpio is optional */
 	if (!host->device_reset)
 		return -EOPNOTSUPP;
+
+	/*
+	 * M52XQ DIAGNOSTIC: the "host reset before device reset" experiment
+	 * (build #83) is reverted here - it never changed the LINERESET
+	 * symptom it targeted, and now that ufshcd_err_handler() actually
+	 * runs a real ufshcd_reset_and_restore() (post-wlun-check fix), the
+	 * extra disable_irq/enable_irq pair inside ufs_qcom_host_reset()
+	 * here was unbalancing against ufshcd_hba_stop()'s own IRQ
+	 * disable/enable, leaving the UFS IRQ masked and hanging the
+	 * second NOP OUT's completion wait forever (confirmed via
+	 * "Unbalanced enable for IRQ 30" WARN + VDITRACE never returning
+	 * from ufshcd_exec_dev_cmd() on retry).
+	 */
 
 	/*
 	 * The UFS device shall detect reset pulses of 1us, sleep for 10us to

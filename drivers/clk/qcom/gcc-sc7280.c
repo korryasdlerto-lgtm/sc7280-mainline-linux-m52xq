@@ -3463,15 +3463,16 @@ static int gcc_sc7280_probe(struct platform_device *pdev)
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
-	/* Keep some clocks always-on */
-	qcom_branch_set_clk_en(regmap, 0x26004);/* GCC_CAMERA_AHB_CLK */
-	qcom_branch_set_clk_en(regmap, 0x26028);/* GCC_CAMERA_XO_CLK */
-	qcom_branch_set_clk_en(regmap, 0x27004);/* GCC_DISP_AHB_CLK */
-	qcom_branch_set_clk_en(regmap, 0x2701c);/* GCC_DISP_XO_CLK */
-	qcom_branch_set_clk_en(regmap, 0x28004);/* GCC_VIDEO_AHB_CLK */
-	qcom_branch_set_clk_en(regmap, 0x28014);/* GCC_VIDEO_XO_CLK */
-	qcom_branch_set_clk_en(regmap, 0x71004);/* GCC_GPU_CFG_AHB_CLK */
-	regmap_update_bits(regmap, 0x7100C, BIT(13), BIT(13));
+	/*
+	 * XXX(m52xq debug): the camera/disp/video/gpu AHB+XO "keep
+	 * always-on" branch-enable writes below hang this specific board
+	 * hard (whole CPU core wedged, confirmed via per-CPU heartbeat +
+	 * probe tracing -- GCC's own probe never returns, regardless of
+	 * every devicetree-side fix already tried). Very likely these
+	 * CBCR registers are TZ/XPU-protected on this device and a raw
+	 * HLOS regmap write to them locks up the bus. Skipped entirely
+	 * until camera/display/video/gpu bring-up is actually attempted.
+	 */
 
 	/* FORCE_MEM_CORE_ON for ufs phy ice core clocks */
 	qcom_branch_set_force_mem_core(regmap, gcc_ufs_phy_ice_core_clk, true);

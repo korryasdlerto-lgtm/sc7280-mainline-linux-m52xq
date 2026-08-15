@@ -671,7 +671,11 @@ static int really_probe(struct device *dev, const struct device_driver *drv)
 		return -EPROBE_DEFER;
 	}
 
+	pr_err("PROBETRACE-cpu%d-before-check_suppliers-dev=%s\n",
+	       smp_processor_id(), dev_name(dev));
 	link_ret = device_links_check_suppliers(dev);
+	pr_err("PROBETRACE-cpu%d-after-check_suppliers-dev=%s-ret=%d\n",
+	       smp_processor_id(), dev_name(dev), link_ret);
 	if (link_ret == -EPROBE_DEFER)
 		return link_ret;
 

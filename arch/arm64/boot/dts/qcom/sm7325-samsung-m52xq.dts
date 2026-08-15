@@ -92,6 +92,7 @@
 	 * до этого момента, возможная причина отказа принять образ. */
 	qcom,msm-id = <0x1db 0x10000 0x203 0x10000>;
 	qcom,board-id = <0x00 0x00>;
+	dtbo-version = <0x00>;
 
 	aliases {
 		serial0 = &uart5;

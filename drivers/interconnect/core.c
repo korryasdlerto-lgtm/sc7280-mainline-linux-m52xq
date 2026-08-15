@@ -386,20 +386,24 @@ struct icc_node_data *of_icc_get_from_provider(const struct of_phandle_args *spe
 	mutex_lock(&icc_lock);
 	list_for_each_entry(provider, &icc_providers, provider_list) {
 		if (device_match_of_node(provider->dev, spec->np)) {
+			pr_err("ICCTRACE-provider-match-dev=%s\n", dev_name(provider->dev));
 			if (provider->xlate_extended) {
 				data = provider->xlate_extended(spec, provider->data);
+				pr_err("ICCTRACE-xlate_extended-err=%ld\n", PTR_ERR_OR_ZERO(data));
 				if (!IS_ERR(data)) {
 					node = data->node;
 					break;
 				}
 			} else {
 				node = provider->xlate(spec, provider->data);
+				pr_err("ICCTRACE-xlate-err=%ld\n", PTR_ERR_OR_ZERO(node));
 				if (!IS_ERR(node))
 					break;
 			}
 		}
 	}
 	mutex_unlock(&icc_lock);
+	pr_err("ICCTRACE-provider-loop-done-node-err=%ld\n", PTR_ERR_OR_ZERO(node));
 
 	if (!node)
 		return ERR_PTR(-EINVAL);
@@ -499,14 +503,18 @@ struct icc_path *of_icc_get_by_index(struct device *dev, int idx)
 
 	of_node_put(dst_args.np);
 
+	pr_err("ICCTRACE-src_args.np=%pOF-id=%u\n", src_args.np, src_args.args[0]);
 	src_data = of_icc_get_from_provider(&src_args);
+	pr_err("ICCTRACE-src_data-err=%ld\n", PTR_ERR_OR_ZERO(src_data));
 
 	if (IS_ERR(src_data)) {
 		dev_err_probe(dev, PTR_ERR(src_data), "error finding src node\n");
 		return ERR_CAST(src_data);
 	}
 
+	pr_err("ICCTRACE-dst_args.np=%pOF-id=%u\n", dst_args.np, dst_args.args[0]);
 	dst_data = of_icc_get_from_provider(&dst_args);
+	pr_err("ICCTRACE-dst_data-err=%ld\n", PTR_ERR_OR_ZERO(dst_data));
 
 	if (IS_ERR(dst_data)) {
 		dev_err_probe(dev, PTR_ERR(dst_data), "error finding dst node\n");

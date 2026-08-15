@@ -5,6 +5,7 @@
 
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/string.h>
 #include <linux/regmap.h>
 #include <linux/platform_device.h>
 #include <linux/clk-provider.h>
@@ -337,7 +338,9 @@ int qcom_cc_really_probe(struct device *dev,
 	if (!cc)
 		return -ENOMEM;
 
+	pr_err("CCTRACE-A-before-pm_domain_attach_list\n");
 	ret = devm_pm_domain_attach_list(dev, NULL, &cc->pd_list);
+	pr_err("CCTRACE-B-after-pm_domain_attach_list-ret=%d\n", ret);
 	if (ret < 0 && ret != -EEXIST)
 		return ret;
 
@@ -351,6 +354,7 @@ int qcom_cc_really_probe(struct device *dev,
 			return ret;
 	}
 
+	pr_err("CCTRACE-C-before-driver_data-block\n");
 	if (desc->driver_data) {
 		ret = qcom_cc_clk_pll_configure(desc->driver_data, regmap);
 		if (ret)
@@ -358,6 +362,7 @@ int qcom_cc_really_probe(struct device *dev,
 
 		qcom_cc_clk_regs_configure(dev, desc->driver_data, regmap);
 	}
+	pr_err("CCTRACE-D-after-driver_data-block\n");
 
 	reset = &cc->reset;
 	reset->rcdev.of_node = dev->of_node;
@@ -367,11 +372,14 @@ int qcom_cc_really_probe(struct device *dev,
 	reset->regmap = regmap;
 	reset->reset_map = desc->resets;
 
+	pr_err("CCTRACE-E-before-reset_controller_register\n");
 	ret = devm_reset_controller_register(dev, &reset->rcdev);
+	pr_err("CCTRACE-F-after-reset_controller_register-ret=%d\n", ret);
 	if (ret)
 		goto put_rpm;
 
 	if (desc->gdscs && desc->num_gdscs) {
+		pr_err("CCTRACE-G-before-gdsc_register-num=%zu\n", desc->num_gdscs);
 		scd = devm_kzalloc(dev, sizeof(*scd), GFP_KERNEL);
 		if (!scd) {
 			ret = -ENOMEM;
@@ -388,6 +396,7 @@ int qcom_cc_really_probe(struct device *dev,
 					       scd);
 		if (ret)
 			goto put_rpm;
+		pr_err("CCTRACE-H-after-gdsc_register\n");
 	}
 
 	if (desc->driver_data &&
@@ -405,26 +414,56 @@ int qcom_cc_really_probe(struct device *dev,
 
 	qcom_cc_drop_protected(dev, cc);
 
+	pr_err("CCTRACE-I-before-clk_hw-loop-num=%zu\n", num_clk_hws);
 	for (i = 0; i < num_clk_hws; i++) {
 		ret = devm_clk_hw_register(dev, clk_hws[i]);
-		if (ret)
+		if (ret) {
+			pr_err("CCTRACE-J-clk_hw-loop-FAILED-i=%d-ret=%d\n", i, ret);
 			goto put_rpm;
+		}
 	}
+	pr_err("CCTRACE-K-after-clk_hw-loop\n");
 
+	pr_err("CCTRACE-L-before-clks-loop-num=%zu\n", num_clks);
 	for (i = 0; i < num_clks; i++) {
+		const char *clk_name;
+
 		if (!rclks[i])
 			continue;
 
+		clk_name = rclks[i]->hw.init ? rclks[i]->hw.init->name : "?";
+
+		/*
+		 * XXX(m52xq debug): gcc_mss_q6ss_boot_clk_src's registration
+		 * (recalc_rate reading MSS-domain registers) hangs this
+		 * board hard -- confirmed via per-clock probe tracing, the
+		 * modem/MSS remoteproc subsystem is never brought up in this
+		 * test setup so its clock-control registers are presumably
+		 * unclocked/inaccessible from HLOS at this point. Skip until
+		 * modem bring-up is actually attempted.
+		 */
+		if (!strcmp(clk_name, "gcc_mss_q6ss_boot_clk_src") ||
+		    !strcmp(clk_name, "gcc_sec_ctrl_clk_src")) {
+			pr_err("CCTRACE-R-SKIPPING-hang-prone-clk-i=%d-name=%s\n", i, clk_name);
+			continue;
+		}
+
+		pr_err("CCTRACE-Q-clk-i=%d-name=%s\n", i, clk_name);
 		ret = devm_clk_register_regmap(dev, rclks[i]);
-		if (ret)
+		if (ret) {
+			pr_err("CCTRACE-M-clks-loop-FAILED-i=%d-ret=%d\n", i, ret);
 			goto put_rpm;
+		}
 	}
+	pr_err("CCTRACE-N-after-clks-loop\n");
 
 	ret = devm_of_clk_add_hw_provider(dev, qcom_cc_clk_hw_get, cc);
+	pr_err("CCTRACE-O-after-add_hw_provider-ret=%d\n", ret);
 	if (ret)
 		goto put_rpm;
 
 	ret = qcom_cc_icc_register(dev, desc);
+	pr_err("CCTRACE-P-after-icc_register-ret=%d\n", ret);
 
 put_rpm:
 	if (desc->use_rpm)

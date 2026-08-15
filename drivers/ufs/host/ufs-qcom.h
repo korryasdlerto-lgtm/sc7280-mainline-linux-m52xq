@@ -202,8 +202,23 @@ enum {
 /* QUniPro Vendor specific attributes */
 #define PA_TX_HSG1_SYNC_LENGTH	0x1552
 #define PA_VS_CONFIG_REG1	0x9000
+#define PA_VS_CONFIG_REG2	0x9005
 #define DME_VS_CORE_CLK_CTRL	0xD002
 #define TX_HS_EQUALIZER		0x0037
+
+/*
+ * M52XQ (yupik) HSG4 CFGREADY sampling errata workaround
+ * (downstream HW CR 'QCTDD06985523'): PHY config-ready signals are
+ * driven by a 150MHz clock but sampled by the controller at 300MHz,
+ * so around the sampling edge only one of tx_cfg_rdyn_0/1 may be seen
+ * as not-ready if timing margin is tight - bypass CFGREADY sampling
+ * and rely on tx_savestatusn instead.
+ */
+#define BIT_TX_EOB_COND				BIT(23)
+#define BIT_RX_EOB_COND				BIT(5)
+#define BIT_LINKCFG_WAIT_LL1_RX_CFG_RDY		BIT(26)
+#define H8_ENTER_COND_OFFSET			0x6
+#define H8_ENTER_COND_MASK			GENMASK(7, 6)
 
 /* bit and mask definitions for DME_VS_CORE_CLK_CTRL attribute */
 #define CLK_1US_CYCLES_MASK_V4				GENMASK(27, 16)

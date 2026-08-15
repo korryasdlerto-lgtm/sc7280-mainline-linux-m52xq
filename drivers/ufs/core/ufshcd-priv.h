@@ -382,6 +382,12 @@ static inline int ufshcd_update_ee_usr_mask(struct ufs_hba *hba,
 
 static inline int ufshcd_rpm_get_sync(struct ufs_hba *hba)
 {
+	/*
+	 * M52XQ DIAGNOSTIC: err_handling_prepare() now runs pre-first-probe
+	 * (ufs_device_wlun still NULL) too - nothing to runtime-resume yet.
+	 */
+	if (!hba->ufs_device_wlun)
+		return 0;
 	return pm_runtime_get_sync(&hba->ufs_device_wlun->sdev_gendev);
 }
 
@@ -407,6 +413,9 @@ static inline int ufshcd_rpm_resume(struct ufs_hba *hba)
 
 static inline void ufshcd_rpm_put(struct ufs_hba *hba)
 {
+	/* M52XQ DIAGNOSTIC: counterpart guard to ufshcd_rpm_get_sync() above. */
+	if (!hba->ufs_device_wlun)
+		return;
 	pm_runtime_put(&hba->ufs_device_wlun->sdev_gendev);
 }
 

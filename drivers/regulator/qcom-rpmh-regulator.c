@@ -1857,6 +1857,20 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
 
 		ret = rpmh_regulator_init_vreg(vreg, dev, node, pmic_id,
 						vreg_data);
+		if (ret == -EINVAL) {
+			/*
+			 * XXX(m52xq debug): downstream RSC nodes have extra
+			 * sibling children per physical rail ("-ao"/"-so"
+			 * always-on/sleep-only resource variants) that don't
+			 * exist in mainline's per-PMIC tables at all. Don't
+			 * abort the whole node over an unrecognized *extra*
+			 * child -- the real one is usually a sibling that
+			 * still matches fine.
+			 */
+			dev_dbg(dev, "%pOFn: skipping unrecognized child (probably a downstream -ao/-so variant)\n",
+				node);
+			continue;
+		}
 		if (ret < 0)
 			return ret;
 	}

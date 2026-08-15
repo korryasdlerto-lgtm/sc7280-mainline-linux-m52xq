@@ -572,7 +572,11 @@ static void ufshcd_print_evt(struct ufs_hba *hba, u32 id,
 
 static void ufshcd_print_evt_hist(struct ufs_hba *hba)
 {
-	ufshcd_dump_regs(hba, 0, UFSHCI_REG_SPACE_SIZE, "host_regs: ");
+	/* M52XQ diag build: host_regs dump is very verbose and floods the
+	 * pstore ring buffer during repeated err_handler retries, pushing
+	 * out earlier boot-time trace lines before they can be pulled.
+	 * ufshcd_dump_regs(hba, 0, UFSHCI_REG_SPACE_SIZE, "host_regs: ");
+	 */
 
 	ufshcd_print_evt(hba, UFS_EVT_PA_ERR, "pa_err");
 	ufshcd_print_evt(hba, UFS_EVT_DL_ERR, "dl_err");
@@ -2608,6 +2612,21 @@ ufshcd_dispatch_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 
 	ufshcd_add_uic_command_trace(hba, uic_cmd, UFS_CMD_SEND);
 
+	/*
+	 * M52XQ DIAGNOSTIC: log every UIC command dispatch with a full
+	 * register snapshot right before issuing it, to see exactly what
+	 * commands fire in the ~100ms window after DME_LINK_STARTUP and
+	 * whether HCS/IS/UECPA/UECDL already show anything odd before we
+	 * even send this command.
+	 */
+	pr_err("UICCMDTRACE-dispatch-t=%llu-cmd=0x%x-arg1=0x%x-arg2=0x%x-arg3=0x%x-HCS=0x%x-IS=0x%x-UECPA=0x%x-UECDL=0x%x\n",
+	       local_clock(), uic_cmd->command, uic_cmd->argument1,
+	       uic_cmd->argument2, uic_cmd->argument3,
+	       ufshcd_readl(hba, REG_CONTROLLER_STATUS),
+	       ufshcd_readl(hba, REG_INTERRUPT_STATUS),
+	       ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER),
+	       ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER));
+
 	/* Write UIC Cmd */
 	ufshcd_writel(hba, uic_cmd->command & COMMAND_OPCODE_MASK,
 		      REG_UIC_COMMAND);
@@ -3365,10 +3384,15 @@ static int ufshcd_issue_dev_cmd(struct ufs_hba *hba, struct scsi_cmnd *cmd,
 static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 		enum dev_cmd_type cmd_type, int timeout)
 {
-	struct scsi_cmnd *cmd = ufshcd_get_dev_mgmt_cmd(hba);
-	struct ufshcd_lrb *lrbp = scsi_cmd_priv(cmd);
+	struct scsi_cmnd *cmd;
+	struct ufshcd_lrb *lrbp;
 	u32 tag;
 	int err;
+
+	pr_err("EXECDEVTRACE-before-get_dev_mgmt_cmd\n");
+	cmd = ufshcd_get_dev_mgmt_cmd(hba);
+	pr_err("EXECDEVTRACE-after-get_dev_mgmt_cmd-cmd=%d\n", !!cmd);
+	lrbp = scsi_cmd_priv(cmd);
 
 	/* Protects use of hba->dev_cmd. */
 	lockdep_assert_held(&hba->dev_cmd.lock);
@@ -3379,12 +3403,17 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 	tag = scsi_cmd_to_rq(cmd)->tag;
 
 	err = ufshcd_compose_dev_cmd(hba, cmd, cmd_type, tag);
+	pr_err("EXECDEVTRACE-after-compose-err=%d\n", err);
 	if (unlikely(err))
 		goto out;
 
+	pr_err("EXECDEVTRACE-before-issue_dev_cmd\n");
 	err = ufshcd_issue_dev_cmd(hba, cmd, tag, timeout);
-	if (err == 0)
+	pr_err("EXECDEVTRACE-after-issue_dev_cmd-err=%d\n", err);
+	if (err == 0) {
 		err = ufshcd_dev_cmd_completion(hba, lrbp);
+		pr_err("EXECDEVTRACE-after-dev_cmd_completion-err=%d\n", err);
+	}
 
 out:
 	ufshcd_put_dev_mgmt_cmd(cmd);
@@ -4411,6 +4440,23 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
 
 check_upmcrs:
 	status = ufshcd_get_upmcrs(hba);
+	/*
+	 * M52XQ DIAGNOSTIC: per UniPro v1.8 5.7.12.1.1, PA rejects a
+	 * subsequent PMC request that races with e.g. a LINERESET recovery
+	 * already in flight, reporting PWR_BUSY instead of ever completing.
+	 * Poll a bit instead of failing immediately on that specific status.
+	 */
+	if (status == PWR_BUSY) {
+		int poll_ms = 100;
+
+		pr_err("PMCPOLLTRACE-busy-start\n");
+		while (status == PWR_BUSY && poll_ms-- > 0) {
+			usleep_range(1000, 1100);
+			status = ufshcd_get_upmcrs(hba);
+		}
+		pr_err("PMCPOLLTRACE-busy-end-status=0x%x-poll_ms_left=%d\n",
+		       status, poll_ms);
+	}
 	if (status != PWR_LOCAL) {
 		dev_err(hba->dev,
 			"pwr ctrl cmd 0x%x with (MIBattribute 0x%x, mode 0x%x) failed, host upmcrs:0x%x\n",
@@ -4529,6 +4575,8 @@ int ufshcd_link_recovery(struct ufs_hba *hba)
 	int ret;
 	unsigned long flags;
 
+	pr_err("LINKRECTRACE-enter\n");
+
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	hba->ufshcd_state = UFSHCD_STATE_RESET;
 	ufshcd_set_eh_in_progress(hba);
@@ -4538,6 +4586,7 @@ int ufshcd_link_recovery(struct ufs_hba *hba)
 	ufshcd_device_reset(hba);
 
 	ret = ufshcd_host_reset_and_restore(hba);
+	pr_err("LINKRECTRACE-after-host_reset_and_restore-ret=%d\n", ret);
 
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	if (ret)
@@ -4721,6 +4770,23 @@ static int ufshcd_get_max_pwr_mode(struct ufs_hba *hba)
 		}
 		pwr_info->pwr_tx = SLOW_MODE;
 	}
+
+	pr_err("GEARCAPTRACE-negotiated-gear_rx=%d-gear_tx=%d-pwr_rx=%d-pwr_tx=%d-hs_rate=%d\n",
+	       pwr_info->gear_rx, pwr_info->gear_tx,
+	       pwr_info->pwr_rx, pwr_info->pwr_tx, pwr_info->hs_rate);
+
+	/*
+	 * M52XQ DIAGNOSTIC: force HS-G1 instead of the negotiated max gear
+	 * (usually G4) to test whether the post-link-startup LINERESET storm
+	 * is specific to high-speed gear 4 PHY calibration/timing, or happens
+	 * regardless of gear.
+	 */
+	if (pwr_info->gear_rx > UFS_HS_G1)
+		pwr_info->gear_rx = UFS_HS_G1;
+	if (pwr_info->gear_tx > UFS_HS_G1)
+		pwr_info->gear_tx = UFS_HS_G1;
+	pr_err("GEARCAPTRACE-forced-gear_rx=%d-gear_tx=%d\n",
+	       pwr_info->gear_rx, pwr_info->gear_tx);
 
 	hba->max_pwr_info.is_valid = true;
 	return 0;
@@ -5157,6 +5223,44 @@ void ufshcd_update_evt_hist(struct ufs_hba *hba, u32 id, u32 val)
 }
 EXPORT_SYMBOL_GPL(ufshcd_update_evt_hist);
 
+/*
+ * M52XQ DIAGNOSTIC: full PA attribute snapshot, read-only. Captures the
+ * connected-vs-active lane distinction plus gear/termination/TActivate/
+ * HSSeries state, called at three points: right after DME_LINK_STARTUP,
+ * right before the first NOP OUT, and right after the first UECPA error
+ * interrupt. Goal: catch "active" attributes diverging from "connected"
+ * ones (e.g. active lanes dropping to 0, or gear/termination flipping)
+ * between those points, which would implicate a specific PA state
+ * transition rather than a raw PHY problem.
+ */
+static void ufshcd_m52xq_pa_dump(struct ufs_hba *hba, const char *tag)
+{
+	u32 conn_tx = 0, conn_rx = 0, act_tx = 0, act_rx = 0;
+	u32 tx_gear = 0, rx_gear = 0, tx_term = 0, rx_term = 0;
+	u32 tactivate = 0, hsseries = 0;
+
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDTXDATALANES), &conn_tx);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_CONNECTEDRXDATALANES), &conn_rx);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_ACTIVETXDATALANES), &act_tx);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_ACTIVERXDATALANES), &act_rx);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_TXGEAR), &tx_gear);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_RXGEAR), &rx_gear);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_TXTERMINATION), &tx_term);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_RXTERMINATION), &rx_term);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_TACTIVATE), &tactivate);
+	ufshcd_dme_get(hba, UIC_ARG_MIB(PA_HSSERIES), &hsseries);
+
+	pr_err("PADUMPTRACE-%s-t=%llu-conn_tx=%u-conn_rx=%u-act_tx=%u-act_rx=%u-tx_gear=%u-rx_gear=%u-tx_term=%u-rx_term=%u-tactivate=%u-hsseries=%u\n",
+	       tag, local_clock(), conn_tx, conn_rx, act_tx, act_rx,
+	       tx_gear, rx_gear, tx_term, rx_term, tactivate, hsseries);
+}
+
+/* Reset once per link-startup attempt so we capture only the FIRST
+ * post-error snapshot per attempt (repeated DME_GET traffic during an
+ * active error storm would itself perturb the thing being observed).
+ */
+static bool m52xq_first_uecpa_dumped;
+
 /**
  * ufshcd_link_startup - Initialize unipro link startup
  * @hba: per adapter instance
@@ -5179,9 +5283,18 @@ static int ufshcd_link_startup(struct ufs_hba *hba)
 
 link_startup:
 	do {
+		pr_err("LINKTRACE-before-vops_link_startup_notify-retries=%d\n", retries);
 		ufshcd_vops_link_startup_notify(hba, PRE_CHANGE);
+		pr_err("LINKTRACE-before-dme_link_startup\n");
 
 		ret = ufshcd_dme_link_startup(hba);
+		pr_err("LINKTRACE-after-dme_link_startup-ret=%d-dev_present=%d\n",
+		       ret, ufshcd_is_device_present(hba));
+
+		if (!ret) {
+			m52xq_first_uecpa_dumped = false;
+			ufshcd_m52xq_pa_dump(hba, "after-link-startup");
+		}
 
 		/* check if device is detected by inter-connect layer */
 		if (!ret && !ufshcd_is_device_present(hba)) {
@@ -5262,11 +5375,15 @@ static int ufshcd_verify_dev_init(struct ufs_hba *hba)
 	int err = 0;
 	int retries;
 
+	pr_err("VDITRACE-enter-before-lock\n");
 	ufshcd_dev_man_lock(hba);
+	pr_err("VDITRACE-after-lock\n");
+	ufshcd_m52xq_pa_dump(hba, "before-first-nop-out");
 
 	for (retries = NOP_OUT_RETRIES; retries > 0; retries--) {
 		err = ufshcd_exec_dev_cmd(hba, DEV_CMD_TYPE_NOP,
 					  hba->nop_out_timeout);
+		pr_err("VDITRACE-attempt-retries_left=%d-err=%d\n", retries, err);
 
 		if (!err || err == -ETIMEDOUT)
 			break;
@@ -5275,6 +5392,7 @@ static int ufshcd_verify_dev_init(struct ufs_hba *hba)
 	}
 
 	ufshcd_dev_man_unlock(hba);
+	pr_err("VDITRACE-after-unlock-final_err=%d\n", err);
 
 	if (err)
 		dev_err(hba->dev, "%s: NOP OUT failed %d\n", __func__, err);
@@ -5718,6 +5836,13 @@ static irqreturn_t ufshcd_uic_cmd_compl(struct ufs_hba *hba, u32 intr_status)
 	if (intr_status & UIC_COMMAND_COMPL) {
 		cmd->argument2 |= ufshcd_get_uic_cmd_result(hba);
 		cmd->argument3 = ufshcd_get_dme_attr_val(hba);
+		pr_err("UICCMDTRACE-compl-t=%llu-cmd=0x%x-result=0x%lx-arg3=0x%x-HCS=0x%x-IS=0x%x-UECPA=0x%x-UECDL=0x%x\n",
+		       local_clock(), cmd->command, ufshcd_get_uic_cmd_result(hba),
+		       cmd->argument3,
+		       ufshcd_readl(hba, REG_CONTROLLER_STATUS),
+		       intr_status,
+		       ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER),
+		       ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER));
 		if (!hba->uic_async_done)
 			cmd->cmd_active = false;
 		complete(&cmd->done);
@@ -6655,8 +6780,15 @@ static void ufshcd_err_handling_prepare(struct ufs_hba *hba)
 	 */
 	pm_runtime_get_sync(hba->dev);
 	ufshcd_rpm_get_sync(hba);
-	if (pm_runtime_status_suspended(&hba->ufs_device_wlun->sdev_gendev) ||
-	    hba->is_sys_suspended) {
+	/*
+	 * M52XQ DIAGNOSTIC: ufs_device_wlun is NULL pre-first-probe (we now
+	 * reach this path in that case too, since should_stop() no longer
+	 * bails out on !ufs_device_wlun). Guard the dereference instead of
+	 * crashing (Oops at __pm_runtime_resume via NULL wlun->sdev_gendev).
+	 */
+	if (hba->ufs_device_wlun &&
+	    (pm_runtime_status_suspended(&hba->ufs_device_wlun->sdev_gendev) ||
+	     hba->is_sys_suspended)) {
 		enum ufs_pm_op pm_op;
 
 		/*
@@ -6681,14 +6813,28 @@ static void ufshcd_err_handling_prepare(struct ufs_hba *hba)
 			ufshcd_suspend_clkscaling(hba);
 		ufshcd_clk_scaling_allow(hba, false);
 	}
-	/* Wait for ongoing ufshcd_queuecommand() calls to finish. */
-	blk_mq_quiesce_tagset(&hba->host->tag_set);
+	/*
+	 * M52XQ DIAGNOSTIC: quiescing the tagset here deadlocks when we're
+	 * running pre-first-probe (ufs_device_wlun still NULL, per the
+	 * should_stop() fix above) - ufshcd_reset_and_restore() below ends
+	 * up calling ufshcd_verify_dev_init() -> ufshcd_issue_dev_cmd() ->
+	 * blk_execute_rq(), which submits a *new* reserved-tag request on
+	 * this exact tagset and blocks forever waiting for it to be
+	 * unquiesced - but that only happens in unprepare() below, AFTER
+	 * this whole reset call chain returns. Confirmed via EXECDEVTRACE:
+	 * issue_dev_cmd never returns on the post-reset retry, unlike the
+	 * pre-reset attempts. There's no real regular SCSI I/O to quiesce
+	 * yet anyway without a registered wlun, so just skip it.
+	 */
+	if (hba->ufs_device_wlun)
+		blk_mq_quiesce_tagset(&hba->host->tag_set);
 	cancel_work_sync(&hba->eeh_work);
 }
 
 static void ufshcd_err_handling_unprepare(struct ufs_hba *hba)
 {
-	blk_mq_unquiesce_tagset(&hba->host->tag_set);
+	if (hba->ufs_device_wlun)
+		blk_mq_unquiesce_tagset(&hba->host->tag_set);
 	ufshcd_release(hba);
 	if (ufshcd_is_clkscaling_supported(hba))
 		ufshcd_clk_scaling_suspend(hba, false);
@@ -6698,8 +6844,18 @@ static void ufshcd_err_handling_unprepare(struct ufs_hba *hba)
 
 static inline bool ufshcd_err_handling_should_stop(struct ufs_hba *hba)
 {
+	/*
+	 * M52XQ DIAGNOSTIC: mainline skips all error recovery here when
+	 * ufs_device_wlun is still NULL (i.e. the very first probe hasn't
+	 * succeeded even once), silently marking the state OPERATIONAL and
+	 * returning without ever attempting a real link/host reset. Our
+	 * board never gets past this first probe (NOP OUT always fails), so
+	 * the async err handler was a no-op the whole time we were staring
+	 * at repeating LINERESET storms. Drop the wlun requirement so real
+	 * recovery is attempted even pre-first-probe, to see if it changes
+	 * anything.
+	 */
 	return (!hba->is_powered || hba->shutting_down ||
-		!hba->ufs_device_wlun ||
 		hba->ufshcd_state == UFSHCD_STATE_ERROR ||
 		(!(hba->saved_err || hba->saved_uic_err || hba->force_reset ||
 		   ufshcd_is_link_broken(hba))));
@@ -6708,7 +6864,16 @@ static inline bool ufshcd_err_handling_should_stop(struct ufs_hba *hba)
 #ifdef CONFIG_PM
 static void ufshcd_recover_pm_error(struct ufs_hba *hba)
 {
-	struct scsi_target *starget = hba->ufs_device_wlun->sdev_target;
+	struct scsi_target *starget;
+
+	/*
+	 * M52XQ DIAGNOSTIC: same NULL-wlun scenario as
+	 * ufshcd_err_handling_prepare() above - nothing to recover if the
+	 * wlun scsi device was never created yet (pre-first-probe).
+	 */
+	if (!hba->ufs_device_wlun)
+		return;
+	starget = hba->ufs_device_wlun->sdev_target;
 	struct Scsi_Host *shost = hba->host;
 	struct scsi_device *sdev;
 	struct request_queue *q;
@@ -6837,12 +7002,23 @@ static void ufshcd_err_handler(struct work_struct *work)
 
 	hba = container_of(work, struct ufs_hba, eh_work);
 
-	dev_info(hba->dev,
-		 "%s started; HBA state %s; powered %d; shutting down %d; saved_err = 0x%x; saved_uic_err = 0x%x; force_reset = %d%s\n",
-		 __func__, ufshcd_state_name[hba->ufshcd_state],
-		 hba->is_powered, hba->shutting_down, hba->saved_err,
-		 hba->saved_uic_err, hba->force_reset,
-		 ufshcd_is_link_broken(hba) ? "; link is broken" : "");
+	/* M52XQ diag build: this fires ~250x during the futile UFS link
+	 * recovery storm and floods the pstore ring buffer, pushing out
+	 * earlier boot-time trace lines before they can be pulled.
+	 */
+	pr_err_once("ERRHANDLERTRACE-first-call-state=%s-saved_err=0x%x-saved_uic_err=0x%x\n",
+		    ufshcd_state_name[hba->ufshcd_state], hba->saved_err, hba->saved_uic_err);
+
+	/*
+	 * M52XQ DIAGNOSTIC: point-3 PA snapshot ("after first UECPA"),
+	 * taken here (process context, safe to sleep) rather than inside
+	 * the hard-IRQ error-interrupt handler where DME_GET's blocking
+	 * wait_for_completion() would be illegal.
+	 */
+	if (!m52xq_first_uecpa_dumped) {
+		m52xq_first_uecpa_dumped = true;
+		ufshcd_m52xq_pa_dump(hba, "after-first-uecpa-errhandler");
+	}
 
 	if (hba->ufs_device_wlun) {
 		/*
@@ -6990,9 +7166,11 @@ do_reset:
 	if (needs_reset) {
 		int err;
 
+		pr_err("EHTRACE-do_reset-enter-retries_left=%d\n", retries);
 		hba->force_reset = false;
 		spin_unlock_irqrestore(hba->host->host_lock, flags);
 		err = ufshcd_reset_and_restore(hba);
+		pr_err("EHTRACE-reset_and_restore-ret=%d\n", err);
 		if (err)
 			dev_err(hba->dev, "%s: reset and restore failed with err %d\n",
 					__func__, err);
@@ -7009,6 +7187,8 @@ skip_err_handling:
 			dev_err_ratelimited(hba->dev, "%s: exit: saved_err 0x%x saved_uic_err 0x%x",
 			    __func__, hba->saved_err, hba->saved_uic_err);
 	}
+	pr_err("EHTRACE-loopend-needs_reset=%d-needs_restore=%d-state=%s-retries=%d\n",
+	       needs_reset, needs_restore, ufshcd_state_name[hba->ufshcd_state], retries);
 	/* Exit in an operational state or dead */
 	if (hba->ufshcd_state != UFSHCD_STATE_OPERATIONAL &&
 	    hba->ufshcd_state != UFSHCD_STATE_ERROR) {
@@ -7040,6 +7220,20 @@ static irqreturn_t ufshcd_update_uic_error(struct ufs_hba *hba)
 
 	/* PHY layer error */
 	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER);
+	/*
+	 * M52XQ DIAGNOSTIC: log the raw UECPA reading plus whatever UIC
+	 * command was active at the exact moment this error interrupt
+	 * fired, to see whether our own subsequent DME command provoked
+	 * the LINERESET or whether the PHY breaks with nothing in flight.
+	 */
+	if (reg & UIC_PHY_ADAPTER_LAYER_ERROR_CODE_MASK) {
+		struct uic_command *ac = hba->active_uic_cmd;
+
+		pr_err("UICERRTRACE-t=%llu-UECPA=0x%x-active_cmd=%s-active_cmd_val=0x%x-async_done=%d\n",
+		       local_clock(), reg,
+		       ac ? "yes" : "no", ac ? ac->command : 0,
+		       !!hba->uic_async_done);
+	}
 	if ((reg & UIC_PHY_ADAPTER_LAYER_ERROR) &&
 	    (reg & UIC_PHY_ADAPTER_LAYER_ERROR_CODE_MASK)) {
 		ufshcd_update_evt_hist(hba, UFS_EVT_PA_ERR, reg);
@@ -7181,13 +7375,8 @@ static irqreturn_t ufshcd_check_errors(struct ufs_hba *hba, u32 intr_status)
 		     (INT_FATAL_ERRORS | UFSHCD_UIC_HIBERN8_MASK)) ||
 		    (hba->saved_uic_err &&
 		     (hba->saved_uic_err != UFSHCD_UIC_PA_GENERIC_ERROR))) {
-			dev_err(hba->dev, "%s: saved_err 0x%x saved_uic_err 0x%x\n",
-					__func__, hba->saved_err,
-					hba->saved_uic_err);
-			ufshcd_dump_regs(hba, 0, UFSHCI_REG_SPACE_SIZE,
-					 "host_regs: ");
-			ufshcd_print_pwr_info(hba);
-			ufshcd_print_tx_eq_params(hba);
+			pr_err_once("ERRHANDLERTRACE2-first-checkerrors-saved_err=0x%x-saved_uic_err=0x%x\n",
+				    hba->saved_err, hba->saved_uic_err);
 		}
 		ufshcd_schedule_eh_work(hba);
 		retval |= IRQ_HANDLED;
@@ -8111,14 +8300,18 @@ static int ufshcd_host_reset_and_restore(struct ufs_hba *hba)
 		ufshcd_scale_clks(hba, ULONG_MAX, true);
 
 	err = ufshcd_hba_enable(hba);
+	pr_err("HRRTRACE-after-hba_enable-err=%d\n", err);
 
 	/* Establish the link again and restore the device */
 	if (!err) {
 		ktime_t probe_start = ktime_get();
 
 		err = ufshcd_device_init(hba, /*init_dev_params=*/false);
-		if (!err)
+		pr_err("HRRTRACE-after-device_init-err=%d\n", err);
+		if (!err) {
 			err = ufshcd_probe_hba(hba, false);
+			pr_err("HRRTRACE-after-probe_hba-err=%d\n", err);
+		}
 		ufshcd_process_probe_result(hba, probe_start, err);
 	}
 
@@ -8162,7 +8355,10 @@ static int ufshcd_reset_and_restore(struct ufs_hba *hba)
 		/* Reset the attached device */
 		ufshcd_device_reset(hba);
 
+		pr_err("RRTRACE-before-host_reset_and_restore-retries_left=%d\n", retries);
 		err = ufshcd_host_reset_and_restore(hba);
+		pr_err("RRTRACE-after-host_reset_and_restore-ret=%d-state=%s\n",
+		       err, ufshcd_state_name[hba->ufshcd_state]);
 
 		spin_lock_irqsave(hba->host->host_lock, flags);
 		if (err)
@@ -9345,14 +9541,18 @@ static int ufshcd_device_init(struct ufs_hba *hba, bool init_dev_params)
 	/* UniPro link is active now */
 	ufshcd_set_link_active(hba);
 
+	pr_err("DEVINITTRACE-before-mcq-check-mcq_enabled=%d-init_dev_params=%d\n",
+	       hba->mcq_enabled, init_dev_params);
 	/* Reconfigure MCQ upon reset */
 	if (hba->mcq_enabled && !init_dev_params) {
 		ufshcd_config_mcq(hba);
 		ufshcd_mcq_enable(hba);
 	}
 
+	pr_err("DEVINITTRACE-before-verify_dev_init\n");
 	/* Verify device initialization by sending NOP OUT UPIU */
 	ret = ufshcd_verify_dev_init(hba);
+	pr_err("DEVINITTRACE-after-verify_dev_init-ret=%d\n", ret);
 	if (ret)
 		return ret;
 
@@ -9878,14 +10078,17 @@ static int ufshcd_hba_init(struct ufs_hba *hba)
 	 * of the initialization here.
 	 */
 	err = ufshcd_init_hba_vreg(hba);
+	pr_err("HBATRACE-after-init_hba_vreg-err=%d\n", err);
 	if (err)
 		goto out;
 
 	err = ufshcd_setup_hba_vreg(hba, true);
+	pr_err("HBATRACE-after-setup_hba_vreg-err=%d\n", err);
 	if (err)
 		goto out;
 
 	err = ufshcd_init_clocks(hba);
+	pr_err("HBATRACE-after-init_clocks-err=%d\n", err);
 	if (err)
 		goto out_disable_hba_vreg;
 
@@ -9893,18 +10096,22 @@ static int ufshcd_hba_init(struct ufs_hba *hba)
 		hba->dev_ref_clk_freq = ufshcd_parse_ref_clk_property(hba);
 
 	err = ufshcd_setup_clocks(hba, true);
+	pr_err("HBATRACE-after-setup_clocks-err=%d\n", err);
 	if (err)
 		goto out_disable_hba_vreg;
 
 	err = ufshcd_init_vreg(hba);
+	pr_err("HBATRACE-after-init_vreg-err=%d\n", err);
 	if (err)
 		goto out_disable_clks;
 
 	err = ufshcd_setup_vreg(hba, true);
+	pr_err("HBATRACE-after-setup_vreg-err=%d\n", err);
 	if (err)
 		goto out_disable_clks;
 
 	err = ufshcd_variant_hba_init(hba);
+	pr_err("HBATRACE-after-variant_hba_init-err=%d\n", err);
 	if (err)
 		goto out_disable_vreg;
 
@@ -11094,7 +11301,9 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	 */
 	hba->vcc_off_delay_us = 2000;
 
+	pr_err("UFSTRACE-before-hba_init\n");
 	err = ufshcd_hba_init(hba);
+	pr_err("UFSTRACE-after-hba_init-err=%d\n", err);
 	if (err)
 		goto out_error;
 

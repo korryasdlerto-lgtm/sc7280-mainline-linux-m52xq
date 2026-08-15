@@ -534,7 +534,9 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 		return err;
 	}
 
+	pr_err("UFSTRACE-before-ufshcd_init\n");
 	err = ufshcd_init(hba, mmio_base, irq);
+	pr_err("UFSTRACE-after-ufshcd_init-err=%d\n", err);
 	if (err) {
 		dev_err_probe(dev, err, "Initialization failed with error %d\n",
 			      err);

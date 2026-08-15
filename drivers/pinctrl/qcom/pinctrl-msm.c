@@ -68,6 +68,7 @@ struct msm_pinctrl {
 	int irq;
 
 	bool intr_target_use_scm;
+	bool m52_skip_hw_direction_probe;
 
 	raw_spinlock_t lock;
 
@@ -607,6 +608,17 @@ static int msm_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
 	u32 val;
 
 	g = &pctrl->soc->groups[offset];
+
+	/*
+	 * Registration-time eager direction probe (gpiochip_add_data_with_key)
+	 * reads every gpio's ctl register before any consumer exists. On this
+	 * board some pins hang the bus when read this early (M52XQ-specific
+	 * hardware quirk, root cause not yet identified). We don't need the
+	 * real value at registration time, so skip the hardware access there
+	 * and only do a real read for on-demand (post-registration) callers.
+	 */
+	if (pctrl->m52_skip_hw_direction_probe)
+		return GPIO_LINE_DIRECTION_IN;
 
 	val = msm_readl_ctl(pctrl, g);
 
@@ -1454,7 +1466,9 @@ static int msm_gpio_init(struct msm_pinctrl *pctrl)
 	girq->parents[0] = pctrl->irq;
 	girq->init_valid_mask = msm_gpio_irq_init_valid_mask;
 
+	pctrl->m52_skip_hw_direction_probe = true;
 	ret = devm_gpiochip_add_data(pctrl->dev, &pctrl->chip, pctrl);
+	pctrl->m52_skip_hw_direction_probe = false;
 	if (ret) {
 		dev_err(pctrl->dev, "Failed register gpiochip\n");
 		return ret;
@@ -1572,14 +1586,18 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 				return PTR_ERR(pctrl->regs[i]);
 		}
 	} else {
+		pr_err("PINCTRACE-before-ioremap\n");
 		pctrl->regs[0] = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+		pr_err("PINCTRACE-after-ioremap\n");
 		if (IS_ERR(pctrl->regs[0]))
 			return PTR_ERR(pctrl->regs[0]);
 
 		pctrl->phys_base[0] = res->start;
 	}
 
+	pr_err("PINCTRACE-before-pm_reset\n");
 	msm_pinctrl_setup_pm_reset(pctrl);
+	pr_err("PINCTRACE-after-pm_reset\n");
 
 	pctrl->irq = platform_get_irq(pdev, 0);
 	if (pctrl->irq < 0)
@@ -1593,7 +1611,9 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 	pctrl->desc.pins = pctrl->soc->pins;
 	pctrl->desc.npins = pctrl->soc->npins;
 
+	pr_err("PINCTRACE-before-pinctrl_register\n");
 	pctrl->pctrl = devm_pinctrl_register(&pdev->dev, &pctrl->desc, pctrl);
+	pr_err("PINCTRACE-after-pinctrl_register\n");
 	if (IS_ERR(pctrl->pctrl)) {
 		dev_err(&pdev->dev, "Couldn't register pinctrl driver\n");
 		return PTR_ERR(pctrl->pctrl);
@@ -1606,8 +1626,10 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 		if (ret < 0)
 			return ret;
 	}
+	pr_err("PINCTRACE-before-gpio_init\n");
 
 	ret = msm_gpio_init(pctrl);
+	pr_err("PINCTRACE-after-gpio_init-ret=%d\n", ret);
 	if (ret)
 		return ret;
 
