@@ -79,6 +79,36 @@
 		.id = did,						\
 	}
 
+#define Q6AFE_PSEUDO_TX_DAI(did) {				\
+		.capture = {						\
+			.stream_name = #did" Capture",		\
+			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
+				SNDRV_PCM_RATE_48000,			\
+			.formats = SNDRV_PCM_FMTBIT_S16_LE,		\
+			.channels_min = 1,				\
+			.channels_max = 2,				\
+			.rate_min = 8000,				\
+			.rate_max = 48000,				\
+		},							\
+		.name = #did,						\
+		.id = did,						\
+	}
+
+#define Q6AFE_PSEUDO_RX_DAI(did) {				\
+		.playback = {						\
+			.stream_name = #did" Playback",		\
+			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
+				SNDRV_PCM_RATE_48000,			\
+			.formats = SNDRV_PCM_FMTBIT_S16_LE,		\
+			.channels_min = 1,				\
+			.channels_max = 2,				\
+			.rate_min = 8000,				\
+			.rate_max = 48000,				\
+		},							\
+		.name = #did,						\
+		.id = did,						\
+	}
+
 #define Q6AFE_DP_RX_DAI(did) {						\
 		.playback = {						\
 			.stream_name = #did" Playback",			\
@@ -666,6 +696,9 @@ static struct snd_soc_dai_driver q6dsp_audio_fe_dais[] = {
 	Q6AFE_CDC_DMA_TX_DAI(TX_CODEC_DMA_TX_4),
 	Q6AFE_CDC_DMA_RX_DAI(RX_CODEC_DMA_RX_5),
 	Q6AFE_CDC_DMA_TX_DAI(TX_CODEC_DMA_TX_5),
+	Q6AFE_PSEUDO_TX_DAI(VOICE_RECORD_RX),
+	Q6AFE_PSEUDO_TX_DAI(VOICE_RECORD_TX),
+	Q6AFE_PSEUDO_RX_DAI(VOICE_PLAYBACK_TX),
 	Q6AFE_CDC_DMA_RX_DAI(RX_CODEC_DMA_RX_6),
 	Q6AFE_CDC_DMA_RX_DAI(RX_CODEC_DMA_RX_7),
 };
@@ -722,6 +755,9 @@ struct snd_soc_dai_driver *q6dsp_audio_ports_set_config(struct device *dev,
 			break;
 		case USB_RX:
 			q6dsp_audio_fe_dais[i].ops = cfg->q6usb_ops;
+			break;
+		case VOICE_RECORD_RX ... VOICE_PLAYBACK_TX:
+			q6dsp_audio_fe_dais[i].ops = cfg->q6pseudo_ops;
 			break;
 		default:
 			break;

@@ -538,6 +538,19 @@ config TOUCHSCREEN_S6SY761
 	  To compile this driver as module, choose M here: the
 	  module will be called s6sy761.
 
+config TOUCHSCREEN_SYNAPTICS_TCM_ONCELL
+	tristate "Synaptics TCM Oncell Touchscreen driver"
+	depends on I2C
+	help
+	  Say Y here if you have a touchscreen using Synaptics's TCM oncell
+	  interface (e.g. the S3908), as found on the OnePlus 8T and the
+	  Samsung Galaxy M52 5G (m52xq).
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called synaptics_tcm_oncell.
+
 config TOUCHSCREEN_GUNZE
 	tristate "Gunze AHL-51S touchscreen"
 	select SERIO

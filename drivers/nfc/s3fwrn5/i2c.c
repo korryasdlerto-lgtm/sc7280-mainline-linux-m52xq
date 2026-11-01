@@ -212,6 +212,9 @@ MODULE_DEVICE_TABLE(i2c, s3fwrn5_i2c_id_table);
 
 static const struct of_device_id of_s3fwrn5_i2c_match[] __maybe_unused = {
 	{ .compatible = "samsung,s3fwrn5-i2c", },
+	/* m52xq: the bootloader overlays the stock DTBO, which renames the node's compatible to "sec-nfc";
+	 * en-gpios/wake-gpios come from the base DT (same polarity as the stock VEN/FIRM lines) */
+	{ .compatible = "sec-nfc", },
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_s3fwrn5_i2c_match);

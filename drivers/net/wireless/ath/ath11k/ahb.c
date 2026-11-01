@@ -5,6 +5,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/of_device.h>
@@ -719,11 +720,25 @@ static int ath11k_ahb_hif_suspend(struct ath11k_base *ab)
 	return ret;
 }
 
+/* M52XQ: knobs of the resume handshake with the WPSS firmware (/sys/module/ath11k_ahb/parameters). After a number of WoW sleeps the
+ * Samsung firmware (WLAN.MSL.1.0.1.c3-00228) does not answer the SMP2P POWER_SAVE_EXIT with WMI_WOW_WAKEUP_HOST ("timed out while waiting
+ * for wow wakeup completion", then WMI timeouts and a WPSS crash loop): a pause before the exit message, a longer wait and a resend. */
+static unsigned int m52xq_resume_delay_ms;	/* pause before the first POWER_SAVE_EXIT */
+module_param(m52xq_resume_delay_ms, uint, 0644);
+MODULE_PARM_DESC(m52xq_resume_delay_ms, "M52XQ: ms to wait before SMP2P POWER_SAVE_EXIT on resume");
+static unsigned int m52xq_resume_wait_s = 3;	/* wait for the firmware's answer per attempt */
+module_param(m52xq_resume_wait_s, uint, 0644);
+MODULE_PARM_DESC(m52xq_resume_wait_s, "M52XQ: seconds to wait for WoW wakeup completion per attempt");
+static unsigned int m52xq_resume_retries;	/* extra POWER_SAVE_EXIT messages after a timeout */
+module_param(m52xq_resume_retries, uint, 0644);
+MODULE_PARM_DESC(m52xq_resume_retries, "M52XQ: resends of SMP2P POWER_SAVE_EXIT after a timeout");
+
 static int ath11k_ahb_hif_resume(struct ath11k_base *ab)
 {
 	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
 	u32 wake_irq;
 	u32 value = 0;
+	unsigned int attempt;
 	int ret;
 
 	if (!device_may_wakeup(ab->dev))
@@ -737,29 +752,38 @@ static int ath11k_ahb_hif_resume(struct ath11k_base *ab)
 		return ret;
 	}
 
-	reinit_completion(&ab->wow.wakeup_completed);
+	if (m52xq_resume_delay_ms)
+		msleep(m52xq_resume_delay_ms);
 
-	value = u32_encode_bits(ab_ahb->smp2p_info.seq_no++,
-				ATH11K_AHB_SMP2P_SMEM_SEQ_NO);
-	value |= u32_encode_bits(ATH11K_AHB_POWER_SAVE_EXIT,
-				 ATH11K_AHB_SMP2P_SMEM_MSG);
+	for (attempt = 0; attempt <= m52xq_resume_retries; attempt++) {
+		reinit_completion(&ab->wow.wakeup_completed);
 
-	ret = qcom_smem_state_update_bits(ab_ahb->smp2p_info.smem_state,
-					  ATH11K_AHB_SMP2P_SMEM_VALUE_MASK, value);
-	if (ret) {
-		ath11k_err(ab, "failed to send smp2p power save enter cmd :%d\n", ret);
-		return ret;
+		value = u32_encode_bits(ab_ahb->smp2p_info.seq_no++,
+					ATH11K_AHB_SMP2P_SMEM_SEQ_NO);
+		value |= u32_encode_bits(ATH11K_AHB_POWER_SAVE_EXIT,
+					 ATH11K_AHB_SMP2P_SMEM_MSG);
+
+		ret = qcom_smem_state_update_bits(ab_ahb->smp2p_info.smem_state,
+						  ATH11K_AHB_SMP2P_SMEM_VALUE_MASK, value);
+		if (ret) {
+			ath11k_err(ab, "failed to send smp2p power save enter cmd :%d\n", ret);
+			return ret;
+		}
+
+		ret = wait_for_completion_timeout(&ab->wow.wakeup_completed,
+						  (m52xq_resume_wait_s ? m52xq_resume_wait_s : 3) * HZ);
+		if (ret) {
+			if (attempt)
+				ath11k_warn(ab, "m52xq: wow wakeup completed after %u resend(s) of power save exit\n", attempt);
+			ath11k_dbg(ab, ATH11K_DBG_AHB, "device resumed\n");
+			return 0;
+		}
+
+		ath11k_warn(ab, "timed out while waiting for wow wakeup completion (attempt %u of %u)\n",
+			    attempt + 1, m52xq_resume_retries + 1);
 	}
 
-	ret = wait_for_completion_timeout(&ab->wow.wakeup_completed, 3 * HZ);
-	if (ret == 0) {
-		ath11k_warn(ab, "timed out while waiting for wow wakeup completion\n");
-		return -ETIMEDOUT;
-	}
-
-	ath11k_dbg(ab, ATH11K_DBG_AHB, "device resumed\n");
-
-	return 0;
+	return -ETIMEDOUT;
 }
 
 static const struct ath11k_hif_ops ath11k_ahb_hif_ops_ipq8074 = {
@@ -1299,10 +1323,75 @@ free_resources:
 	ath11k_ahb_free_resources(ab);
 }
 
+static __maybe_unused int ath11k_ahb_pm_suspend(struct device *dev)
+{
+	struct ath11k_base *ab = dev_get_drvdata(dev);
+	int ret;
+
+	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags))
+		return 0;
+
+	ret = ath11k_core_suspend(ab);
+	if (ret && ret != -EOPNOTSUPP)
+		ath11k_warn(ab, "failed to suspend core: %d\n", ret);
+
+	/* do not block the system suspend */
+	return 0;
+}
+
+static __maybe_unused int ath11k_ahb_pm_resume(struct device *dev)
+{
+	struct ath11k_base *ab = dev_get_drvdata(dev);
+	int ret;
+
+	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags))
+		return 0;
+
+	ret = ath11k_core_resume(ab);
+	if (ret && ret != -EOPNOTSUPP)
+		ath11k_warn(ab, "failed to resume core: %d\n", ret);
+
+	return ret == -EOPNOTSUPP ? 0 : ret;
+}
+
+static __maybe_unused int ath11k_ahb_pm_suspend_late(struct device *dev)
+{
+	struct ath11k_base *ab = dev_get_drvdata(dev);
+	int ret;
+
+	ret = ath11k_core_suspend_late(ab);
+	if (ret && ret != -EOPNOTSUPP)
+		ath11k_warn(ab, "failed to late suspend core: %d\n", ret);
+
+	return 0;
+}
+
+static __maybe_unused int ath11k_ahb_pm_resume_early(struct device *dev)
+{
+	struct ath11k_base *ab = dev_get_drvdata(dev);
+	int ret;
+
+	ret = ath11k_core_resume_early(ab);
+	if (ret && ret != -EOPNOTSUPP)
+		ath11k_warn(ab, "failed to early resume core: %d\n", ret);
+
+	return ret == -EOPNOTSUPP ? 0 : ret;
+}
+
+static const struct dev_pm_ops __maybe_unused ath11k_ahb_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(ath11k_ahb_pm_suspend,
+				ath11k_ahb_pm_resume)
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(ath11k_ahb_pm_suspend_late,
+				     ath11k_ahb_pm_resume_early)
+};
+
 static struct platform_driver ath11k_ahb_driver = {
 	.driver = {
 		.name = "ath11k",
 		.of_match_table = ath11k_ahb_of_match,
+#ifdef CONFIG_PM
+		.pm = &ath11k_ahb_pm_ops,
+#endif
 	},
 	.probe = ath11k_ahb_probe,
 	.remove = ath11k_ahb_remove,

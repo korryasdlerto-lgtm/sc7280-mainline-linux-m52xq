@@ -1025,6 +1025,25 @@ config FUEL_GAUGE_SC27XX
 	  Say Y here to enable support for fuel gauge with SC27XX
 	  PMIC chips.
 
+config CHARGER_SM5714
+	tristate "Silicon Mitus SM5714 charger current control"
+	depends on I2C
+	depends on LEDS_CLASS
+	help
+	  Say Y here to set the input and charge current of the Silicon Mitus
+	  SM5714 charger by adapter type (BC1.2 result of its MUIC) and to apply
+	  Samsung's battery temperature zones, as on the Samsung Galaxy M52 5G.
+
+config BATTERY_SM5714
+	tristate "Silicon Mitus SM5714 fuel gauge (read-only)"
+	depends on I2C
+	depends on IIO
+	help
+	  Say Y here to read battery state of charge, voltage, current and
+	  temperature from the fuel gauge part of the Silicon Mitus SM5714,
+	  as found on the Samsung Galaxy M52 5G. The driver never writes the
+	  charger configuration.
+
 config FUEL_GAUGE_STC3117
        tristate "STMicroelectronics STC3117 fuel gauge driver"
        depends on CRC8

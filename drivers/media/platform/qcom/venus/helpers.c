@@ -8,6 +8,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
+#include <linux/iommu.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/v4l2-mem2mem.h>
 #include <asm/div64.h>
@@ -36,7 +37,21 @@ struct intbuf {
 	unsigned long attrs;
 	enum dpb_buf_owner owned_by;
 	u32 dpb_out_tag;
+	bool secure;			/* M52XQ: lives in the secure non-pixel context */
+	struct venus_sec_buf sb;
 };
+
+/* M52XQ: 1 = the encoder's PERSIST buffer comes from the secure non-pixel context (as downstream) */
+static bool m52xq_sec_persist;
+module_param(m52xq_sec_persist, bool, 0644);
+
+static void intbuf_free(struct venus_core *core, struct intbuf *buf)
+{
+	if (buf->secure)
+		venus_secure_free(core, &buf->sb);
+	else
+		dma_free_attrs(core->dev, buf->size, buf->va, buf->da, buf->attrs);
+}
 
 bool venus_helper_check_codec(struct venus_inst *inst, u32 v4l2_pixfmt)
 {
@@ -159,6 +174,16 @@ int venus_helper_free_dpb_bufs(struct venus_inst *inst)
 }
 EXPORT_SYMBOL_GPL(venus_helper_free_dpb_bufs);
 
+
+/* M52DBG: temporary diagnostics (Venus NoC fault hunt) */
+static void m52_dbg(struct device *dev, const char *what, dma_addr_t da, size_t size)
+{
+	struct iommu_domain *d = iommu_get_domain_for_dev(dev);
+	phys_addr_t pa = d ? iommu_iova_to_phys(d, da) : 0;
+
+	pr_info("M52DBG %s da=%pad size=%zu dom=%p type=%d phys=%pa\n", what, &da, size, d, d ? d->type : -1, &pa);
+}
+
 int venus_helper_alloc_dpb_bufs(struct venus_inst *inst)
 {
 	struct venus_core *core = inst->core;
@@ -208,6 +233,7 @@ int venus_helper_alloc_dpb_bufs(struct venus_inst *inst)
 			ret = -ENOMEM;
 			goto fail;
 		}
+		m52_dbg(dev, "dpb", buf->da, buf->size);
 		buf->owned_by = DRIVER;
 
 		id = ida_alloc_min(&inst->dpb_ids, VB2_MAX_FRAME, GFP_KERNEL);
@@ -258,11 +284,21 @@ static int intbufs_set_buffer(struct venus_inst *inst, u32 type)
 		buf->size = bufreq.size;
 		buf->attrs = DMA_ATTR_WRITE_COMBINE |
 			     DMA_ATTR_NO_KERNEL_MAPPING;
-		buf->va = dma_alloc_attrs(dev, buf->size, &buf->da, GFP_KERNEL,
-					  buf->attrs);
-		if (!buf->va) {
-			ret = -ENOMEM;
-			goto fail;
+		if (m52xq_sec_persist && inst->session_type == VIDC_SESSION_TYPE_ENC &&
+		    buf->type == HFI_BUFFER_INTERNAL_PERSIST) {
+			ret = venus_secure_alloc(core, buf->size, &buf->sb);
+			if (ret)
+				goto fail;
+			buf->secure = true;
+			buf->da = buf->sb.da;
+		} else {
+			buf->va = dma_alloc_attrs(dev, buf->size, &buf->da, GFP_KERNEL,
+						  buf->attrs);
+			if (!buf->va) {
+				ret = -ENOMEM;
+				goto fail;
+			}
+			m52_dbg(dev, "intbuf", buf->da, buf->size);
 		}
 
 		memset(&bd, 0, sizeof(bd));
@@ -283,7 +319,7 @@ static int intbufs_set_buffer(struct venus_inst *inst, u32 type)
 	return 0;
 
 dma_free:
-	dma_free_attrs(dev, buf->size, buf->va, buf->da, buf->attrs);
+	intbuf_free(core, buf);
 fail:
 	kfree(buf);
 	return ret;
@@ -305,8 +341,7 @@ static int intbufs_unset_buffers(struct venus_inst *inst)
 		ret = hfi_session_unset_buffers(inst, &bd);
 
 		list_del_init(&buf->list);
-		dma_free_attrs(inst->core->dev, buf->size, buf->va, buf->da,
-			       buf->attrs);
+		intbuf_free(inst->core, buf);
 		kfree(buf);
 	}
 
@@ -395,8 +430,7 @@ int venus_helper_intbufs_realloc(struct venus_inst *inst)
 
 		ret = hfi_session_unset_buffers(inst, &bd);
 
-		dma_free_attrs(inst->core->dev, buf->size, buf->va, buf->da,
-			       buf->attrs);
+		intbuf_free(inst->core, buf);
 
 		list_del_init(&buf->list);
 		kfree(buf);
@@ -1449,6 +1483,7 @@ int venus_helper_vb2_buf_init(struct vb2_buffer *vb)
 
 	buf->size = vb2_plane_size(vb, 0);
 	buf->dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
+	m52_dbg(inst->core->dev, vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE ? "vb2-cap" : "vb2-out", buf->dma_addr, buf->size);
 
 	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		list_add_tail(&buf->reg_list, &inst->registeredbufs);

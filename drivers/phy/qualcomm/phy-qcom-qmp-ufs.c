@@ -33,6 +33,10 @@
 #include "phy-qcom-qmp-qserdes-txrx-ufs-v6.h"
 #include "phy-qcom-qmp-qserdes-txrx-ufs-v7.h"
 
+/* M52XQ: UFS recovery trace, printed only while the error handler runs */
+extern bool m52xq_ufs_rectrace;
+#define M52_TR(fmt, ...) do { if (m52xq_ufs_rectrace) pr_info(fmt, ##__VA_ARGS__); } while (0)
+
 /* QPHY_PCS_READY_STATUS bit */
 #define PCS_READY				BIT(0)
 
@@ -262,6 +266,21 @@ static const struct qmp_phy_init_tbl sc7280_ufsphy_rx[] = {
 };
 
 static const struct qmp_phy_init_tbl sc7280_ufsphy_pcs[] = {
+	/*
+	 * M52XQ (yupik) downstream unconditionally clears bit1
+	 * (UFS_PHY_RX_LINECFG_DISABLE_BIT) here before link startup via
+	 * ufs_qcom_phy_ctrl_rx_linecfg(phy, true) in
+	 * ufs_qcom_link_startup_notify(PRE_CHANGE) - mainline never
+	 * touches this register at all, leaving it at its hardware
+	 * power-on-reset value. Downstream's comment: "Some UFS devices
+	 * send incorrect LineCfg data as part of power mode change
+	 * sequence which may cause host PHY to go into bad state" -
+	 * matches our symptom (link comes up, then generic PA
+	 * error/LINERESET). Applying this during PHY calibration (which
+	 * always runs before link startup) is timing-equivalent to
+	 * downstream's PRE_CHANGE call.
+	 */
+	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_LINECFG_DISABLE, 0x00),
 	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_RX_SIGDET_CTRL2, 0x6d),
 	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_TX_LARGE_AMP_DRV_LVL, 0x0a),
 	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_TX_SMALL_AMP_DRV_LVL, 0x02),
@@ -639,6 +658,23 @@ static const struct qmp_phy_init_tbl sm8150_ufsphy_hs_g4_pcs[] = {
 	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_TX_HS_GEAR_BAND, 0x1b),
 	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_TX_HSGEAR_CAPABILITY, 0x04),
 	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_RX_HSGEAR_CAPABILITY, 0x04),
+	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_BIST_FIXED_PAT_CTRL, 0x0a),
+};
+
+/*
+ * M52XQ (yupik) real downstream G4 calibration (phy_cal_table_rate_A in
+ * phy-qcom-ufs-qmp-v4-yupik.h) only overrides TX_LARGE_AMP_DRV_LVL and
+ * BIST_FIXED_PAT_CTRL for gear4 - it never touches PLL_CNTL,
+ * TIMER_20US_CORECLK_STEPS, TX_PWM_GEAR_BAND, TX_HS_GEAR_BAND or
+ * TX/RX_HSGEAR_CAPABILITY. sm8150_ufsphy_hs_g4_pcs above (borrowed from a
+ * different SoC) overrides all of those to sm8150-specific values, which
+ * do not match this board's real hardware and cause the link to come up
+ * briefly then drop with a generic PA error. Use base sc7280_ufsphy_pcs
+ * values for everything except the two registers downstream actually
+ * changes for gear4.
+ */
+static const struct qmp_phy_init_tbl m52xq_ufsphy_hs_g4_pcs[] = {
+	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_TX_LARGE_AMP_DRV_LVL, 0x10),
 	QMP_PHY_INIT_CFG(QPHY_V4_PCS_UFS_BIST_FIXED_PAT_CTRL, 0x0a),
 };
 
@@ -1440,8 +1476,8 @@ static const struct qmp_phy_cfg sc7280_ufsphy_cfg = {
 		.tx_num         = ARRAY_SIZE(sm8250_ufsphy_hs_g4_tx),
 		.rx             = sc7280_ufsphy_hs_g4_rx,
 		.rx_num         = ARRAY_SIZE(sc7280_ufsphy_hs_g4_rx),
-		.pcs            = sm8150_ufsphy_hs_g4_pcs,
-		.pcs_num        = ARRAY_SIZE(sm8150_ufsphy_hs_g4_pcs),
+		.pcs            = m52xq_ufsphy_hs_g4_pcs,
+		.pcs_num        = ARRAY_SIZE(m52xq_ufsphy_hs_g4_pcs),
 		.max_gear	= UFS_HS_G4,
 	},
 	.vreg_list              = sc7280_ufsphy_vreg_l,
@@ -1921,6 +1957,7 @@ static void qmp_ufs_init_registers(struct qmp_ufs *qmp, const struct qmp_phy_cfg
 	qmp_ufs_init_all(qmp, &cfg->tbls);
 
 	i = qmp_ufs_get_gear_overlay(qmp, cfg);
+	pr_debug("PHYCALTRACE-submode=%d-overlay_idx=%d-mode=%d\n", qmp->submode, i, qmp->mode);
 	if (i >= 0) {
 		qmp_ufs_init_all(qmp, &cfg->tbls_hs_overlay[i]);
 	}
@@ -1968,8 +2005,10 @@ static int qmp_ufs_phy_calibrate(struct phy *phy)
 		return ret;
 
 	qmp_ufs_init_registers(qmp, cfg);
+	M52_TR("PHYRECTRACE-after-init_registers\n");
 
 	ret = reset_control_deassert(qmp->ufs_reset);
+	M52_TR("PHYRECTRACE-after-reset_deassert-ret=%d\n", ret);
 	if (ret)
 		return ret;
 
@@ -1983,6 +2022,7 @@ static int qmp_ufs_phy_calibrate(struct phy *phy)
 	status = pcs + cfg->regs[QPHY_PCS_READY_STATUS];
 	ret = readl_poll_timeout(status, val, (val & PCS_READY), 200,
 				 PHY_INIT_COMPLETE_TIMEOUT);
+	M52_TR("PHYRECTRACE-after-pcs_ready-ret=%d-val=0x%x\n", ret, val);
 	if (ret) {
 		dev_err(qmp->dev, "phy initialization timed-out\n");
 		return ret;
@@ -2282,6 +2322,10 @@ static const struct of_device_id qmp_ufs_of_match_table[] = {
 		.data = &sm7150_ufsphy_cfg,
 	}, {
 		.compatible = "qcom,sc7280-qmp-ufs-phy",
+		.data = &sc7280_ufsphy_cfg,
+	}, {
+		/* m52xq (yupik/SM7325) downstream compatible, same "sc7280" family */
+		.compatible = "qcom,ufs-phy-qmp-v4-yupik",
 		.data = &sc7280_ufsphy_cfg,
 	}, {
 		.compatible = "qcom,sc8180x-qmp-ufs-phy",

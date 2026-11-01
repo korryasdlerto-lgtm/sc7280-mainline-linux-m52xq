@@ -21,6 +21,7 @@ struct qcom_q6v5 {
 	struct qmp *qmp;
 
 	struct icc_path *path;
+	bool keep_icc_vote;
 
 	unsigned stop_bit;
 

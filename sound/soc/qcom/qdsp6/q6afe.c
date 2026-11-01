@@ -32,6 +32,9 @@
 #define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
 #define AFE_PARAM_ID_HDMI_CONFIG	0x00010210
 #define AFE_MODULE_AUDIO_DEV_INTERFACE	0x0001020C
+#define AFE_PARAM_ID_PSEUDO_PORT_CONFIG	0x00010219
+#define AFE_API_VERSION_PSEUDO_PORT_CONFIG	0x1
+#define AFE_PSEUDOPORT_TIMING_MODE_TIMER	0x1
 #define AFE_MODULE_TDM			0x0001028A
 
 #define AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG 0x00010235
@@ -332,6 +335,9 @@
 /* AFE VA Codec DMA Tx port 2 */
 #define AFE_PORT_ID_VA_CODEC_DMA_TX_2	0xB025
 /* AFE Rx Codec DMA Rx port 0 */
+#define AFE_PORT_ID_VOICE_RECORD_RX	0x8003
+#define AFE_PORT_ID_VOICE_RECORD_TX	0x8004
+#define AFE_PORT_ID_VOICE_PLAYBACK_TX	0x8005
 #define AFE_PORT_ID_RX_CODEC_DMA_RX_0	0xB030
 /* AFE Tx Codec DMA Tx port 0 */
 #define AFE_PORT_ID_TX_CODEC_DMA_TX_0	0xB031
@@ -606,7 +612,17 @@ struct afe_param_id_usb_audio_svc_interval {
 	u32	svc_interval;
 } __packed;
 
+struct afe_param_id_pseudo_port_cfg {
+	u32 pseud_port_cfg_minor_version;
+	u16 bit_width;
+	u16 num_channels;
+	u16 data_format;
+	u16 timing_mode;
+	u32 sample_rate;
+} __packed;
+
 union afe_port_config {
+	struct afe_param_id_pseudo_port_cfg pseudo_cfg;
 	struct afe_param_id_hdmi_multi_chan_audio_cfg hdmi_multi_ch;
 	struct afe_param_id_slimbus_cfg           slim_cfg;
 	struct afe_param_id_i2s_cfg	i2s_cfg;
@@ -903,6 +919,12 @@ static struct afe_port_map port_maps[AFE_PORT_MAX] = {
 				VA_CODEC_DMA_TX_1, 0, 1},
 	[VA_CODEC_DMA_TX_2] = { AFE_PORT_ID_VA_CODEC_DMA_TX_2,
 				VA_CODEC_DMA_TX_2, 0, 1},
+	[VOICE_RECORD_RX] = { AFE_PORT_ID_VOICE_RECORD_RX,
+				VOICE_RECORD_RX, 0, 1},
+	[VOICE_RECORD_TX] = { AFE_PORT_ID_VOICE_RECORD_TX,
+				VOICE_RECORD_TX, 0, 1},
+	[VOICE_PLAYBACK_TX] = { AFE_PORT_ID_VOICE_PLAYBACK_TX,
+				VOICE_PLAYBACK_TX, 1, 1},
 	[RX_CODEC_DMA_RX_0] = { AFE_PORT_ID_RX_CODEC_DMA_RX_0,
 				RX_CODEC_DMA_RX_0, 1, 1},
 	[TX_CODEC_DMA_TX_0] = { AFE_PORT_ID_TX_CODEC_DMA_TX_0,
@@ -1661,6 +1683,25 @@ void q6afe_cdc_dma_port_prepare(struct q6afe_port *port,
 		dma_cfg->active_channels_mask = (1 << cfg->num_channels) - 1;
 }
 EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
+
+/**
+ * q6afe_pseudo_port_prepare() - Prepare an in-call record pseudo port.
+ *
+ * @port: afe port instance
+ * @cfg: pseudo port configuration
+ */
+void q6afe_pseudo_port_prepare(struct q6afe_port *port, struct q6afe_pseudo_cfg *cfg)
+{
+	struct afe_param_id_pseudo_port_cfg *pc = &port->port_cfg.pseudo_cfg;
+
+	pc->pseud_port_cfg_minor_version = AFE_API_VERSION_PSEUDO_PORT_CONFIG;
+	pc->bit_width = cfg->bit_width;
+	pc->num_channels = cfg->num_channels;
+	pc->data_format = 0; /* AFE_LINEAR_PCM_DATA */
+	pc->timing_mode = AFE_PSEUDOPORT_TIMING_MODE_TIMER;
+	pc->sample_rate = cfg->sample_rate;
+}
+EXPORT_SYMBOL_GPL(q6afe_pseudo_port_prepare);
 /**
  * q6afe_port_start() - Start a afe port
  *
@@ -1796,6 +1837,11 @@ struct q6afe_port *q6afe_port_get_from_id(struct device *dev, int id)
 		break;
 	case AFE_PORT_ID_WSA_CODEC_DMA_RX_0 ... AFE_PORT_ID_RX_CODEC_DMA_RX_7:
 		cfg_type = AFE_PARAM_ID_CODEC_DMA_CONFIG;
+		break;
+	case AFE_PORT_ID_VOICE_RECORD_RX:
+	case AFE_PORT_ID_VOICE_RECORD_TX:
+	case AFE_PORT_ID_VOICE_PLAYBACK_TX:
+		cfg_type = AFE_PARAM_ID_PSEUDO_PORT_CONFIG;
 		break;
 	case AFE_PORT_ID_USB_RX:
 		cfg_type = AFE_PARAM_ID_USB_AUDIO_CONFIG;

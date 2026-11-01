@@ -356,8 +356,11 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
 
 	ret = q6dsp_map_channels(&open->dev_channel_mapping[0],
 				 channel_mode);
-	if (ret)
+	if (ret) {
+		dev_err(adm->dev, "m52xq: map_channels failed port %d afe 0x%x ch %d (%d)\n",
+			port_id, afe_port, channel_mode, ret);
 		return ret;
+	}
 
 	return q6adm_apr_send_copp_pkt(adm, copp, pkt, ADM_CMDRSP_DEVICE_OPEN_V5);
 }
@@ -402,6 +405,7 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 	spin_lock_irqsave(&adm->copps_list_lock, flags);
 	copp = q6adm_alloc_copp(adm, port_id);
 	if (IS_ERR(copp)) {
+		dev_err(dev, "m52xq: adm alloc copp failed port %d (%ld)\n", port_id, PTR_ERR(copp));
 		spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 		return ERR_CAST(copp);
 	}
@@ -420,6 +424,8 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 	ret = q6adm_device_open(adm, copp, port_id, path, topology,
 				channel_mode, bit_width, rate);
 	if (ret < 0) {
+		dev_err(dev, "m52xq: adm open failed port %d path %d rate %d ch %d bits %d topo 0x%x (%d)\n",
+			port_id, path, rate, channel_mode, bit_width, topology, ret);
 		kref_put(&copp->refcount, q6adm_free_copp);
 		return ERR_PTR(ret);
 	}

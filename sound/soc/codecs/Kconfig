@@ -2244,6 +2244,14 @@ config SND_SOC_TFA9872
 	depends on I2C
 	select REGMAP_I2C
 
+config SND_SOC_TFA9878
+	tristate "NXP Semiconductors TFA9878 amplifier (minimal)"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Minimal driver for the NXP TFA9878 mono class-D speaker amplifier
+	  as used in the Samsung Galaxy M52 5G.
+
 config SND_SOC_TFA9879
 	tristate "NXP Semiconductors TFA9879 amplifier"
 	depends on I2C

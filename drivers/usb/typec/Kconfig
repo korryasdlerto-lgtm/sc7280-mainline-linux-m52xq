@@ -110,6 +110,16 @@ config TYPEC_WUSB3801
 	  If you choose to build this driver as a dynamically linked module, the
 	  module will be called wusb3801.ko.
 
+config TYPEC_SM5714
+	tristate "Silicon Mitus SM5714 Type-C port driver (CC only)"
+	depends on I2C
+	depends on USB_ROLE_SWITCH
+	help
+	  Say Y or M here for the Type-C port of the Silicon Mitus SM5714
+	  PMIC (Samsung Galaxy M52 5G): attach/detach and orientation from
+	  the CC logic, USB role switching and VBUS for host mode. USB Power
+	  Delivery is not supported.
+
 source "drivers/usb/typec/mux/Kconfig"
 
 source "drivers/usb/typec/altmodes/Kconfig"

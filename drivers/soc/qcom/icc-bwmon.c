@@ -815,6 +815,36 @@ static void bwmon_remove(struct platform_device *pdev)
 	free_irq(bwmon->irq, bwmon);
 }
 
+/*
+ * M52XQ: both bwmon instances leave their last bandwidth vote (CPU -> LLCC up to 7.4 GB/s, LLCC -> DDR up to 4 GB/s) with
+ * the default ALWAYS tag, i.e. also in the RPMh sleep set, for the whole system sleep. Drop the votes and stop the monitors
+ * for the sleep; the interrupt thread sets the vote again when the traffic comes back (measured: -12 mA).
+ */
+static int bwmon_suspend(struct device *dev)
+{
+	struct icc_bwmon *bwmon = dev_get_drvdata(dev);
+
+	disable_irq(bwmon->irq);
+	bwmon_disable(bwmon);
+	dev_pm_opp_set_opp(dev, NULL);
+	/* the vote is gone: forget it, or the first sample after the resume that equals the old value would skip restoring it */
+	bwmon->current_kbps = 0;
+
+	return 0;
+}
+
+static int bwmon_resume(struct device *dev)
+{
+	struct icc_bwmon *bwmon = dev_get_drvdata(dev);
+
+	bwmon_start(bwmon);
+	enable_irq(bwmon->irq);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(bwmon_pm_ops, bwmon_suspend, bwmon_resume);
+
 static const struct icc_bwmon_data msm8998_bwmon_data = {
 	.sample_ms = 4,
 	.count_unit_kb = 1024,
@@ -879,6 +909,7 @@ static struct platform_driver bwmon_driver = {
 	.driver = {
 		.name = "qcom-bwmon",
 		.of_match_table = bwmon_of_match,
+		.pm = pm_sleep_ptr(&bwmon_pm_ops),
 	},
 };
 module_platform_driver(bwmon_driver);

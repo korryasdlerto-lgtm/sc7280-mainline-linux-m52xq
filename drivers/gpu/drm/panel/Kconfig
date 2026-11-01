@@ -925,6 +925,13 @@ config DRM_PANEL_SAMSUNG_S6E3HA8
 	select DRM_DISPLAY_DSC_HELPER
 	select VIDEOMODE_HELPERS
 
+config DRM_PANEL_SAMSUNG_S6E3HAB_AMB667AN01
+	tristate "Samsung S6E3HAB AMB667AN01 DSI command mode panel (M52XQ)"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	select DRM_DISPLAY_DSC_HELPER
+
 config DRM_PANEL_SAMSUNG_S6E63J0X03
 	tristate "Samsung S6E63J0X03 DSI command mode panel"
 	depends on OF

@@ -202,8 +202,11 @@ int venus_firmware_cfg(struct venus_core *core)
 {
 	void __iomem *cpu_cs_base = core->cpu_cs_base;
 
-	if (IS_AR50_LITE(core))
+	/* M52XQ: IRIS2_1 as well (Xiaomi SM7325 encoder reset fix suggested for the same firmware generation) */
+	if (IS_AR50_LITE(core) || IS_IRIS2_1(core)) {
+		pr_info("M52DBG firmware_cfg: CPU_CS_VCICMD ARP_OFF\n");
 		writel(CPU_CS_VCICMD_ARP_OFF, cpu_cs_base + CPU_CS_VCICMD);
+	}
 
 	return 0;
 }

@@ -5,6 +5,7 @@
 
 #include <linux/kernel.h>
 #include <linux/bitops.h>
+#include <linux/string.h>
 #include <linux/err.h>
 #include <linux/bug.h>
 #include <linux/export.h>

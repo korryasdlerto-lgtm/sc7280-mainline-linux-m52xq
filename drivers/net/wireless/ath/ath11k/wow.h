@@ -21,7 +21,7 @@ struct rfc1042_hdr {
 	__be16 snap_type;
 } __packed;
 
-#define ATH11K_WOW_RETRY_NUM		3
+#define ATH11K_WOW_RETRY_NUM		10	/* M52XQ v245: was 3, the firmware sometimes NACKs the first WoW enables (htc suspend not complete) */
 #define ATH11K_WOW_RETRY_WAIT_MS	200
 #define ATH11K_WOW_PATTERNS		22
 

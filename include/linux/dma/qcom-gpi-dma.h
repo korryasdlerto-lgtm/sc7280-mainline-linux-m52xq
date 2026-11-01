@@ -81,6 +81,19 @@ struct gpi_i2c_config {
 	u32 rx_len;
 	enum i2c_op op;
 	bool multi_msg;
+	/*
+	 * M52XQ: shared SE (downstream "qcom,shared", multi-EE): wrap the
+	 * transaction in lock/unlock TREs on the TX channel so this EE owns
+	 * the SE while it runs.
+	 */
+	bool lock;
+	bool unlock;
+	/*
+	 * M52XQ: TX part of a read (GO TRE linked to the RX DMA TRE): raise an
+	 * EOB event for it like downstream (MSM_GPI_I2C_GO_TRE_DWORD3 ieob=1),
+	 * otherwise its TREs are never retired and the TX ring fills up.
+	 */
+	bool link_ieob;
 };
 
 #endif /* QCOM_GPI_DMA_H */

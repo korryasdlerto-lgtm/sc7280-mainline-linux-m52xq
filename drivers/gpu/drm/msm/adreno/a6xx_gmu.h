@@ -66,6 +66,9 @@ struct a6xx_gmu {
 	/* For serializing communication with the GMU: */
 	struct mutex lock;
 
+	/* M52XQ: GMU log write pointer saved at RSC sleep, restored at the next start (as downstream) */
+	u32 m52xq_log_wptr;
+
 	struct drm_gpuvm *vm;
 
 	void __iomem *mmio;
@@ -81,6 +84,7 @@ struct a6xx_gmu {
 	int idle_level;
 
 	struct a6xx_gmu_bo hfi;
+	u32 hfi_fw_version;
 	struct a6xx_gmu_bo debug;
 	struct a6xx_gmu_bo icache;
 	struct a6xx_gmu_bo dcache;

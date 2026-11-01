@@ -63,10 +63,24 @@ static int sm8250_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	struct snd_interval *channels = hw_param_interval(params,
 					SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
+	int id = snd_soc_rtd_to_cpu(rtd, 0)->id;
 
 	rate->min = rate->max = 48000;
 	channels->min = channels->max = 2;
-	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
+	/*
+	 * M52XQ: the TFA9878 on QUINARY MI2S is configured (Samsung container)
+	 * for 2 x 32-bit slots with 24-bit samples, 64 BCLK per frame; 16-bit
+	 * slots raise TDMERR, S32 is rejected by the ADSP ADM (prepare -22).
+	 * Stock mixer_paths: QUIN_MI2S_RX mono (one speaker), QUIN_MI2S_TX
+	 * (I/V sense feedback) stereo, both S24_LE.
+	 */
+	if (id == QUINARY_MI2S_RX)
+		channels->min = channels->max = 1;
+	snd_mask_none(fmt);
+	if (id == QUINARY_MI2S_RX || id == QUINARY_MI2S_TX)
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE); /* 24 in 32-bit slot */
+	else
+		snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
 
 	return 0;
 }
@@ -105,10 +119,11 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
 		break;
 	case QUINARY_MI2S_RX:
+	case QUINARY_MI2S_TX:
 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
 		snd_soc_dai_set_sysclk(cpu_dai,
 			Q6AFE_LPASS_CLK_ID_QUI_MI2S_IBIT,
-			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
+			2 * MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK); /* M52XQ: 64 fs */
 		snd_soc_dai_set_fmt(cpu_dai, fmt);
 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
 		break;

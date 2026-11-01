@@ -1508,7 +1508,7 @@ unlock_out:
 		clk_core_disable_unprepare(core->parent);
 }
 
-static bool clk_ignore_unused __initdata;
+static bool clk_ignore_unused __initdata = true;
 static int __init clk_ignore_unused_setup(char *__unused)
 {
 	clk_ignore_unused = true;
@@ -2513,6 +2513,20 @@ static int clk_core_set_rate_nolock(struct clk_core *core,
 		return 0;
 
 	rate = clk_core_req_round_rate_nolock(core, req_rate);
+
+	/*
+	 * M52XQ DIAGNOSTIC: filtered to just the UFS unipro core clock and
+	 * its RCG source, to check whether the "bail early if nothing to
+	 * do" optimization below is silently skipping the real hardware
+	 * reconfigure because core->rate was already (wrongly?) cached as
+	 * matching the requested rate before any real programming happened.
+	 */
+	if (core->name && (strstr(core->name, "unipro"))) {
+		unsigned long cached = clk_core_get_rate_nolock(core);
+
+		pr_debug("CLKCORESETRATETRACE-name=%s-req_rate=%lu-rounded_rate=%lu-cached_rate=%lu-will_bail=%d\n",
+		       core->name, req_rate, rate, cached, rate == cached);
+	}
 
 	/* bail early if nothing to do */
 	if (rate == clk_core_get_rate_nolock(core))

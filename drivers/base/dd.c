@@ -658,6 +658,9 @@ static int really_probe(struct device *dev, const struct device_driver *drv)
 			   !drv->suppress_bind_attrs;
 	int ret, link_ret;
 
+	pr_debug("PROBETRACE-cpu%d-ENTER-dev=%s-drv=%s\n",
+	       smp_processor_id(), dev_name(dev), drv->name);
+
 	if (defer_all_probes) {
 		/*
 		 * Value of defer_all_probes can be set only by
@@ -668,7 +671,11 @@ static int really_probe(struct device *dev, const struct device_driver *drv)
 		return -EPROBE_DEFER;
 	}
 
+	pr_debug("PROBETRACE-cpu%d-before-check_suppliers-dev=%s\n",
+	       smp_processor_id(), dev_name(dev));
 	link_ret = device_links_check_suppliers(dev);
+	pr_debug("PROBETRACE-cpu%d-after-check_suppliers-dev=%s-ret=%d\n",
+	       smp_processor_id(), dev_name(dev), link_ret);
 	if (link_ret == -EPROBE_DEFER)
 		return link_ret;
 
@@ -774,6 +781,8 @@ pinctrl_bind_failed:
 	device_links_no_driver(dev);
 	device_unbind_cleanup(dev);
 done:
+	pr_debug("PROBETRACE-cpu%d-EXIT-dev=%s-ret=%d\n",
+	       smp_processor_id(), dev_name(dev), ret);
 	return ret;
 }
 

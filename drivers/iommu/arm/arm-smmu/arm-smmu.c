@@ -38,8 +38,12 @@
 
 #include <linux/fsl/mc.h>
 
+#include <linux/firmware/qcom/qcom_scm.h>
+#include <dt-bindings/firmware/qcom,scm.h>
+
 #include "arm-smmu.h"
 #include "../../dma-iommu.h"
+#include "../../iommu-pages.h"
 
 /*
  * Apparently, some Qualcomm arm64 platforms which appear to expose their SMMU
@@ -672,6 +676,81 @@ static int arm_smmu_alloc_context_bank(struct arm_smmu_domain *smmu_domain,
 	return __arm_smmu_alloc_bitmap(smmu->context_map, start, smmu->num_context_banks);
 }
 
+/*
+ * M52XQ: the Venus secure non-pixel stream (SID 0x2184) walks its page tables as VMID_CP_NON_PIXEL.
+ * As in the downstream arm-smmu (arm_smmu_assign_table) every table page of such a domain is
+ * hyp-assigned to {HLOS: RW, CP_NON_PIXEL: R}, otherwise the first table walk of the video block
+ * is an XPU violation (silent system reset).
+ */
+#define M52XQ_SEC_SID	0x2184
+
+static int m52xq_sec_pgtable_assign(void *pages, size_t size, bool secure)
+{
+	struct qcom_scm_vmperm perm[2];
+	phys_addr_t pa = virt_to_phys(pages);
+	u64 src;
+	int n;
+
+	if (secure) {
+		src = BIT(QCOM_SCM_VMID_HLOS);
+		perm[0].vmid = QCOM_SCM_VMID_HLOS;
+		perm[0].perm = QCOM_SCM_PERM_RW;
+		perm[1].vmid = QCOM_SCM_VMID_CP_NON_PIXEL;
+		perm[1].perm = QCOM_SCM_PERM_READ;
+		n = 2;
+	} else {
+		src = BIT(QCOM_SCM_VMID_HLOS) | BIT(QCOM_SCM_VMID_CP_NON_PIXEL);
+		perm[0].vmid = QCOM_SCM_VMID_HLOS;
+		perm[0].perm = QCOM_SCM_PERM_RWX;
+		n = 1;
+	}
+
+	return qcom_scm_assign_mem(pa, ALIGN(size, PAGE_SIZE), &src, perm, n);
+}
+
+static void *m52xq_sec_pgtable_alloc(void *cookie, size_t size, gfp_t gfp)
+{
+	struct arm_smmu_domain *smmu_domain = cookie;
+	void *pages;
+
+	pages = iommu_alloc_pages_node_sz(dev_to_node(smmu_domain->smmu->dev), gfp, size);
+	if (!pages)
+		return NULL;
+
+	if (m52xq_sec_pgtable_assign(pages, size, true)) {
+		pr_err("M52SEC: pgtable assign failed\n");
+		iommu_free_pages(pages);
+		return NULL;
+	}
+
+	return pages;
+}
+
+static void m52xq_sec_pgtable_free(void *cookie, void *pages, size_t size)
+{
+	if (m52xq_sec_pgtable_assign(pages, size, false)) {
+		pr_err("M52SEC: pgtable reclaim failed, leaking a table page\n");
+		return;
+	}
+
+	iommu_free_pages(pages);
+}
+
+static bool m52xq_dev_is_secure_stream(struct device *dev)
+{
+	struct iommu_fwspec *fwspec = dev ? dev_iommu_fwspec_get(dev) : NULL;
+	int i;
+
+	if (!fwspec)
+		return false;
+
+	for (i = 0; i < fwspec->num_ids; i++)
+		if (FIELD_GET(ARM_SMMU_SMR_ID, fwspec->ids[i]) == M52XQ_SEC_SID)
+			return true;
+
+	return false;
+}
+
 static int arm_smmu_init_domain_context(struct arm_smmu_domain *smmu_domain,
 					struct arm_smmu_device *smmu,
 					struct device *dev)
@@ -821,6 +900,12 @@ static int arm_smmu_init_domain_context(struct arm_smmu_domain *smmu_domain,
 
 	if (smmu_domain->pgtbl_quirks)
 		pgtbl_cfg.quirks |= smmu_domain->pgtbl_quirks;
+
+	if (m52xq_dev_is_secure_stream(dev)) {
+		pgtbl_cfg.alloc = m52xq_sec_pgtable_alloc;
+		pgtbl_cfg.free = m52xq_sec_pgtable_free;
+		dev_info(smmu->dev, "M52SEC: secure page tables for %s\n", dev_name(dev));
+	}
 
 	pgtbl_ops = alloc_io_pgtable_ops(fmt, &pgtbl_cfg, smmu_domain);
 	if (!pgtbl_ops) {

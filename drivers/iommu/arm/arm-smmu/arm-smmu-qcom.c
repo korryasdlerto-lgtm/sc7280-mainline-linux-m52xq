@@ -3,6 +3,7 @@
  * Copyright (c) 2019, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/dma-map-ops.h>
 #include <linux/acpi.h>
 #include <linux/adreno-smmu-priv.h>
 #include <linux/delay.h>
@@ -259,6 +260,7 @@ static int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie,
 	struct io_pgtable *pgtable = io_pgtable_ops_to_pgtable(smmu_domain->pgtbl_ops);
 	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
 	struct arm_smmu_cb *cb = &smmu_domain->smmu->cbs[cfg->cbndx];
+	int ret;
 
 	/* The domain must have split pagetables already enabled */
 	if (cb->tcr[0] & ARM_SMMU_TCR_EPD1)
@@ -288,7 +290,17 @@ static int qcom_adreno_smmu_set_ttbr0_cfg(const void *cookie,
 		cb->ttbr[0] |= FIELD_PREP(ARM_SMMU_TTBRn_ASID, cb->cfg->asid);
 	}
 
+	/*
+	 * The SMMU may be runtime-suspended here (GPU idle); writes to the
+	 * context bank would then be lost, causing GPU faults later.
+	 */
+	ret = pm_runtime_resume_and_get(smmu_domain->smmu->dev);
+	if (ret < 0) {
+		dev_err(smmu_domain->smmu->dev, "failed to get runtime PM: %d\n", ret);
+		return ret;
+	}
 	arm_smmu_write_context_bank(smmu_domain->smmu, cb->cfg->cbndx);
+	pm_runtime_put_autosuspend(smmu_domain->smmu->dev);
 
 	return 0;
 }
@@ -369,11 +381,24 @@ static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	    (smmu_domain->cfg.fmt == ARM_SMMU_CTX_FMT_AARCH64))
 		pgtbl_cfg->quirks |= IO_PGTABLE_QUIRK_ARM_TTBR1;
 
+
 	/*
 	 * Initialize private interface with GPU:
 	 */
 
 	priv = dev_get_drvdata(dev);
+	/*
+	 * M52XQ: with qcom_adreno_smmu_def_domain_type() forcing the GPU's
+	 * automatic default domain to IDENTITY (see below), this function is
+	 * no longer reached that early at all -- arm_smmu_attach_dev_identity()
+	 * bypasses init_context() entirely. Kept defensive: returning a hard
+	 * error here previously failed arm_smmu_device_probe() itself (first
+	 * group domain attach is not allowed to fail), taking down the whole
+	 * SMMU ("Failed to register iommu"), which is worse than the original
+	 * bug this was meant to guard against.
+	 */
+	if (!priv)
+		return 0;
 	priv->cookie = smmu_domain;
 	priv->get_ttbr1_cfg = qcom_adreno_smmu_get_ttbr1_cfg;
 	priv->set_ttbr0_cfg = qcom_adreno_smmu_set_ttbr0_cfg;
@@ -398,6 +423,12 @@ static const struct of_device_id qcom_smmu_client_of_match[] __maybe_unused = {
 	{ .compatible = "qcom,glymur-mdss" },
 	{ .compatible = "qcom,mdp4" },
 	{ .compatible = "qcom,mdss" },
+	/*
+	 * M52XQ: downstream QUP0 wrapper; its SE DMA stream (0x123) is shared
+	 * with another EE that uses physical addresses, keep it in bypass
+	 * like downstream does (a translating domain hung the system).
+	 */
+	{ .compatible = "qcom,qupv3-geni-se" },
 	{ .compatible = "qcom,qcm2290-mdss" },
 	{ .compatible = "qcom,sar2130p-mdss" },
 	{ .compatible = "qcom,sc7180-mdss" },
@@ -577,6 +608,26 @@ static int qcom_smmu_def_domain_type(struct device *dev)
 	return match ? IOMMU_DOMAIN_IDENTITY : 0;
 }
 
+/*
+ * M52XQ: with fw_devlink=permissive, arm-smmu's own early initcall can
+ * auto-attach a real default domain to the GPU's SID before the adreno
+ * driver has bound. A real (paging/DMA) domain there calls
+ * qcom_adreno_smmu_alloc_context_bank(), which for the GPU only ever
+ * hands out context bank 0 -- the single bank the GPU is allowed to use.
+ * That early attach then permanently holds bank 0, so the driver's own
+ * real attach later in a6xx_create_vm() finds no free bank and fails
+ * with -ENOSPC. Forcing IDENTITY here makes the early attach go through
+ * arm_smmu_attach_dev_identity() (plain S2CR bypass), which never touches
+ * the context-bank bitmap at all, leaving bank 0 free for the real attach.
+ */
+static int qcom_adreno_smmu_def_domain_type(struct device *dev)
+{
+	if (qcom_adreno_smmu_is_gpu_device(dev))
+		return IOMMU_DOMAIN_IDENTITY;
+
+	return qcom_smmu_def_domain_type(dev);
+}
+
 static int qcom_sdm845_smmu500_reset(struct arm_smmu_device *smmu)
 {
 	int ret;
@@ -633,7 +684,7 @@ static const struct arm_smmu_impl sdm845_smmu_500_impl = {
 static const struct arm_smmu_impl qcom_adreno_smmu_v2_impl = {
 	.init_context = qcom_adreno_smmu_init_context,
 	.cfg_probe = qcom_adreno_smmuv2_cfg_probe,
-	.def_domain_type = qcom_smmu_def_domain_type,
+	.def_domain_type = qcom_adreno_smmu_def_domain_type,
 	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
 	.write_sctlr = qcom_adreno_smmu_write_sctlr,
 	.tlb_sync = qcom_smmu_tlb_sync,
@@ -642,7 +693,7 @@ static const struct arm_smmu_impl qcom_adreno_smmu_v2_impl = {
 
 static const struct arm_smmu_impl qcom_adreno_smmu_500_impl = {
 	.init_context = qcom_adreno_smmu_init_context,
-	.def_domain_type = qcom_smmu_def_domain_type,
+	.def_domain_type = qcom_adreno_smmu_def_domain_type,
 	.reset = arm_mmu500_reset,
 	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
 	.write_sctlr = qcom_adreno_smmu_write_sctlr,

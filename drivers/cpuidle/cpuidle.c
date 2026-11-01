@@ -37,6 +37,7 @@ DEFINE_MUTEX(cpuidle_lock);
 LIST_HEAD(cpuidle_detected_devices);
 
 static int enabled_devices;
+/* M52XQ: was forced to 1 during early bring-up (Aug 2026) -- back to mainline default (cpuidle on) */
 static int off __read_mostly;
 static int initialized __read_mostly;
 

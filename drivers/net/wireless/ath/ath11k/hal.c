@@ -1109,7 +1109,11 @@ int ath11k_hal_srng_setup(struct ath11k_base *ab, enum hal_ring_type type,
 	if (srng_config->lmac_ring)
 		return ring_id;
 
+	if (type == HAL_REO_STATUS)
+		ath11k_dbg(ab, ATH11K_DBG_HAL, "reo status hw init begin\n");
 	ath11k_hal_srng_hw_init(ab, srng);
+	if (type == HAL_REO_STATUS)
+		ath11k_dbg(ab, ATH11K_DBG_HAL, "reo status hw init done\n");
 
 	if (type == HAL_CE_DST) {
 		srng->u.dst_ring.max_buffer_length = params->max_buffer_len;

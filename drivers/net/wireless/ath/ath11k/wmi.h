@@ -606,6 +606,8 @@ enum wmi_tlv_cmd_id {
 	WMI_BPF_SET_VDEV_INSTRUCTIONS_CMDID,
 	WMI_BPF_DEL_VDEV_INSTRUCTIONS_CMDID,
 	WMI_BPF_SET_VDEV_ACTIVE_MODE_CMDID,
+	WMI_BPF_SET_VDEV_ENABLE_CMDID,		/* M52XQ v246: stock (Android APF) path: enable + work memory */
+	WMI_BPF_SET_VDEV_WORK_MEMORY_CMDID,
 	WMI_MNT_FILTER_CMDID = WMI_TLV_CMD(WMI_GRP_MONITOR),
 	WMI_SET_CURRENT_COUNTRY_CMDID = WMI_TLV_CMD(WMI_GRP_REGULATORY),
 	WMI_11D_SCAN_START_CMDID,
@@ -6065,6 +6067,11 @@ struct wmi_wow_add_del_event_cmd {
 	u32 event_bitmap;
 } __packed;
 
+/* firmware flags of WMI_WOW_ENABLE_CMDID (fw-api wmi_unified.h WMI_WOW_FLAG_*) */
+#define WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW		0x00000020
+#define WMI_WOW_FLAG_MOD_DTIM_ON_SYS_SUSPEND	0x00000040
+#define WMI_WOW_FLAG_FORCED_DTIM_ON_SYS_SUSPEND	0x00000080
+
 struct wmi_wow_enable_cmd {
 	u32 tlv_header;
 	u32 enable;
@@ -6601,6 +6608,15 @@ int ath11k_wmi_wow_del_pattern(struct ath11k *ar, u32 vdev_id, u32 pattern_id);
 int ath11k_wmi_wow_add_pattern(struct ath11k *ar, u32 vdev_id, u32 pattern_id,
 			       const u8 *pattern, const u8 *mask,
 			       int pattern_len, int pattern_offset);
+/* M52XQ v227: all wakeup events in one command, 4-word bitmap like qcacld (WMI_WOW_MAX_EVENT_BM_LEN) */
+int ath11k_wmi_wow_add_wakeup_events(struct ath11k *ar, u32 vdev_id, const u32 *bitmaps);
+/* M52XQ v228: APF (packet filter) program of the firmware; the stock driver wakes up through it (BPF_ALLOW) */
+int ath11k_wmi_apf_set_instructions(struct ath11k *ar, u32 vdev_id, const u8 *prog, u32 len);
+int ath11k_wmi_apf_del_instructions(struct ath11k *ar, u32 vdev_id);
+int ath11k_wmi_apf_enable(struct ath11k *ar, u32 vdev_id, bool enable);
+int ath11k_wmi_apf_write_memory(struct ath11k *ar, u32 vdev_id, u32 version, const u8 *prog, u32 len);
+extern unsigned int m52xq_wow_flags;
+extern bool m52xq_wow_evt_array;
 int ath11k_wmi_wow_add_wakeup_event(struct ath11k *ar, u32 vdev_id,
 				    enum wmi_wow_wakeup_event event,
 				    u32 enable);

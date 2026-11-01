@@ -286,6 +286,9 @@ static inline void __exit msm_hdmi_unregister(void) {}
 
 struct msm_dsi;
 #ifdef CONFIG_DRM_MSM_DSI
+void msm_dsi_cmd_frame_begin(void);
+void msm_dsi_cmd_frame_end(void);
+void msm_dsi_cmd_frame_reset(void);
 int dsi_dev_attach(struct platform_device *pdev);
 void dsi_dev_detach(struct platform_device *pdev);
 void __init msm_dsi_register(void);
@@ -300,6 +303,9 @@ bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi);
 struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi);
 const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi);
 #else
+static inline void msm_dsi_cmd_frame_begin(void) {}
+static inline void msm_dsi_cmd_frame_end(void) {}
+static inline void msm_dsi_cmd_frame_reset(void) {}
 static inline void __init msm_dsi_register(void)
 {
 }

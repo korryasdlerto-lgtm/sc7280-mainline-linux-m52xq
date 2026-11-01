@@ -128,7 +128,9 @@
 	{ mix_name, "TX_CODEC_DMA_TX_2", "TX_CODEC_DMA_TX_2"},	\
 	{ mix_name, "TX_CODEC_DMA_TX_3", "TX_CODEC_DMA_TX_3"},	\
 	{ mix_name, "TX_CODEC_DMA_TX_4", "TX_CODEC_DMA_TX_4"},	\
-	{ mix_name, "TX_CODEC_DMA_TX_5", "TX_CODEC_DMA_TX_5"}
+	{ mix_name, "TX_CODEC_DMA_TX_5", "TX_CODEC_DMA_TX_5"},	\
+	{ mix_name, "VOICE_RECORD_RX", "VOICE_RECORD_RX"},	\
+	{ mix_name, "VOICE_RECORD_TX", "VOICE_RECORD_TX"}
 
 #define Q6ROUTING_TX_MIXERS(id)						\
 	SOC_SINGLE_EXT("PRI_MI2S_TX", PRIMARY_MI2S_TX,			\
@@ -325,6 +327,12 @@
 		msm_routing_put_audio_mixer),				\
 	SOC_SINGLE_EXT("TX_CODEC_DMA_TX_5", TX_CODEC_DMA_TX_5,		\
 		id, 1, 0, msm_routing_get_audio_mixer,			\
+		msm_routing_put_audio_mixer),							\
+	SOC_SINGLE_EXT("VOICE_RECORD_RX", VOICE_RECORD_RX,		\
+		id, 1, 0, msm_routing_get_audio_mixer,			\
+		msm_routing_put_audio_mixer),				\
+	SOC_SINGLE_EXT("VOICE_RECORD_TX", VOICE_RECORD_TX,		\
+		id, 1, 0, msm_routing_get_audio_mixer,			\
 		msm_routing_put_audio_mixer),
 
 struct session_data {
@@ -401,6 +409,9 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 			      session->bits_per_sample, 0, 0);
 
 	if (IS_ERR_OR_NULL(copp)) {
+		dev_err(routing_data->dev, "m52xq: stream_open adm_open failed port %d rate %d ch %d bits %d (%ld)\n",
+			session->port_id, session->sample_rate, session->channels,
+			session->bits_per_sample, IS_ERR(copp) ? PTR_ERR(copp) : 0L);
 		mutex_unlock(&routing_data->lock);
 		return -EINVAL;
 	}
@@ -698,6 +709,9 @@ static const struct snd_kcontrol_new rx_codec_dma_rx_0_mixer_controls[] = {
 static const struct snd_kcontrol_new rx_codec_dma_rx_1_mixer_controls[] = {
 	Q6ROUTING_RX_MIXERS(RX_CODEC_DMA_RX_1) };
 
+static const struct snd_kcontrol_new voice_playback_tx_mixer_controls[] = {
+	Q6ROUTING_RX_MIXERS(VOICE_PLAYBACK_TX) };
+
 static const struct snd_kcontrol_new rx_codec_dma_rx_2_mixer_controls[] = {
 	Q6ROUTING_RX_MIXERS(RX_CODEC_DMA_RX_2) };
 
@@ -927,6 +941,9 @@ static const struct snd_soc_dapm_widget msm_qdsp6_widgets[] = {
 	SND_SOC_DAPM_MIXER("RX_CODEC_DMA_RX_1 Audio Mixer", SND_SOC_NOPM, 0, 0,
 		rx_codec_dma_rx_1_mixer_controls,
 		ARRAY_SIZE(rx_codec_dma_rx_1_mixer_controls)),
+	SND_SOC_DAPM_MIXER("VOICE_PLAYBACK_TX Audio Mixer", SND_SOC_NOPM, 0, 0,
+		voice_playback_tx_mixer_controls,
+		ARRAY_SIZE(voice_playback_tx_mixer_controls)),
 	SND_SOC_DAPM_MIXER("RX_CODEC_DMA_RX_2 Audio Mixer", SND_SOC_NOPM, 0, 0,
 		rx_codec_dma_rx_2_mixer_controls,
 		ARRAY_SIZE(rx_codec_dma_rx_2_mixer_controls)),
@@ -1035,6 +1052,7 @@ static const struct snd_soc_dapm_route intercon[] = {
 	Q6ROUTING_RX_DAPM_ROUTE("WSA_CODEC_DMA_RX_1 Audio Mixer", "WSA_CODEC_DMA_RX_1"),
 	Q6ROUTING_RX_DAPM_ROUTE("RX_CODEC_DMA_RX_0 Audio Mixer", "RX_CODEC_DMA_RX_0"),
 	Q6ROUTING_RX_DAPM_ROUTE("RX_CODEC_DMA_RX_1 Audio Mixer", "RX_CODEC_DMA_RX_1"),
+	Q6ROUTING_RX_DAPM_ROUTE("VOICE_PLAYBACK_TX Audio Mixer", "VOICE_PLAYBACK_TX"),
 	Q6ROUTING_RX_DAPM_ROUTE("RX_CODEC_DMA_RX_2 Audio Mixer", "RX_CODEC_DMA_RX_2"),
 	Q6ROUTING_RX_DAPM_ROUTE("RX_CODEC_DMA_RX_3 Audio Mixer", "RX_CODEC_DMA_RX_3"),
 	Q6ROUTING_RX_DAPM_ROUTE("RX_CODEC_DMA_RX_4 Audio Mixer", "RX_CODEC_DMA_RX_4"),

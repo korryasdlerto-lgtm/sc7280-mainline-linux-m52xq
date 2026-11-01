@@ -9361,6 +9361,195 @@ int ath11k_wmi_wow_host_wakeup_ind(struct ath11k *ar)
 	return ret;
 }
 
+/*
+ * M52XQ v227: knobs for the WCN6750 wake-on-packet experiments, writable at run time in
+ * /sys/module/ath11k/parameters (ath11k is built into the kernel). Defaults = the stock Samsung setup
+ * (WCNSS_qcom_cfg.ini: enable_mod_dtim_on_system_suspend=1, gEnableForcedDTIM=1).
+ */
+unsigned int m52xq_wow_flags = WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW | WMI_WOW_FLAG_MOD_DTIM_ON_SYS_SUSPEND |
+			       WMI_WOW_FLAG_FORCED_DTIM_ON_SYS_SUSPEND;
+module_param(m52xq_wow_flags, uint, 0644);
+MODULE_PARM_DESC(m52xq_wow_flags, "M52XQ: flags of WMI_WOW_ENABLE_CMDID (0x20 system suspend, 0x40 mod DTIM, 0x80 forced DTIM)");
+bool m52xq_wow_evt_array = true;
+module_param(m52xq_wow_evt_array, bool, 0644);
+MODULE_PARM_DESC(m52xq_wow_evt_array, "M52XQ: send all wakeup events at once with the 4-word bitmap (qcacld)");
+
+int ath11k_wmi_wow_add_wakeup_events(struct ath11k *ar, u32 vdev_id, const u32 *bitmaps)
+{
+	struct wmi_wow_add_del_event_cmd *cmd;
+	struct sk_buff *skb;
+	size_t len;
+	int ret;
+
+	/* the fixed param of the firmware: vdev_id, is_add and a union of event_bitmap / event_bitmaps[4] */
+	len = sizeof(*cmd) + 3 * sizeof(u32);
+	skb = ath11k_wmi_alloc_skb(ar->wmi->wmi_ab, len);
+	if (!skb)
+		return -ENOMEM;
+
+	cmd = (struct wmi_wow_add_del_event_cmd *)skb->data;
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_WOW_ADD_DEL_EVT_CMD) |
+			  FIELD_PREP(WMI_TLV_LEN, len - TLV_HDR_SIZE);
+	cmd->vdev_id = vdev_id;
+	cmd->is_add = 1;
+	memcpy(&cmd->event_bitmap, bitmaps, 4 * sizeof(u32));
+
+	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "tlv wow add wakeup events 0x%08x %08x %08x %08x vdev_id %d\n",
+		   bitmaps[0], bitmaps[1], bitmaps[2], bitmaps[3], vdev_id);
+
+	ret = ath11k_wmi_cmd_send(ar->wmi, skb, WMI_WOW_ENABLE_DISABLE_WAKE_EVENT_CMDID);
+	if (ret) {
+		ath11k_warn(ar->ab, "failed to send WMI_WOW_ENABLE_DISABLE_WAKE_EVENT_CMDID\n");
+		dev_kfree_skb(skb);
+	}
+
+	return ret;
+}
+
+/* M52XQ v228: fw-api wmi_bpf_set_vdev_instructions_cmd_fixed_param + byte array; filter 0, host bpf version 0 like qcacld */
+int ath11k_wmi_apf_set_instructions(struct ath11k *ar, u32 vdev_id, const u8 *prog, u32 len)
+{
+	struct {
+		u32 tlv_header;
+		u32 vdev_id;
+		u32 filter_id;
+		u32 bpf_version;
+		u32 total_length;
+		u32 current_offset;
+		u32 current_length;
+	} __packed *cmd;
+	struct wmi_tlv *tlv;
+	struct sk_buff *skb;
+	u32 aligned = roundup(len, 4);
+	int ret;
+
+	skb = ath11k_wmi_alloc_skb(ar->wmi->wmi_ab, sizeof(*cmd) + TLV_HDR_SIZE + aligned);
+	if (!skb)
+		return -ENOMEM;
+
+	cmd = (void *)skb->data;
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_BPF_SET_VDEV_INSTRUCTIONS_CMD) |
+			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->vdev_id = vdev_id;
+	cmd->filter_id = 0;
+	cmd->bpf_version = 0;
+	cmd->total_length = len;
+	cmd->current_offset = 0;
+	cmd->current_length = len;
+	tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
+	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) | FIELD_PREP(WMI_TLV_LEN, aligned);
+	memcpy(tlv->value, prog, len);
+
+	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "apf set instructions vdev %d len %u\n", vdev_id, len);
+	ret = ath11k_wmi_cmd_send(ar->wmi, skb, WMI_BPF_SET_VDEV_INSTRUCTIONS_CMDID);
+	if (ret) {
+		ath11k_warn(ar->ab, "failed to send WMI_BPF_SET_VDEV_INSTRUCTIONS_CMDID: %d\n", ret);
+		dev_kfree_skb(skb);
+	}
+	return ret;
+}
+
+int ath11k_wmi_apf_del_instructions(struct ath11k *ar, u32 vdev_id)
+{
+	struct {
+		u32 tlv_header;
+		u32 vdev_id;
+		u32 filter_id;
+	} __packed *cmd;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = ath11k_wmi_alloc_skb(ar->wmi->wmi_ab, sizeof(*cmd));
+	if (!skb)
+		return -ENOMEM;
+	cmd = (void *)skb->data;
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_BPF_DEL_VDEV_INSTRUCTIONS_CMD) |
+			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->vdev_id = vdev_id;
+	cmd->filter_id = 0;
+
+	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "apf del instructions vdev %d\n", vdev_id);
+	ret = ath11k_wmi_cmd_send(ar->wmi, skb, WMI_BPF_DEL_VDEV_INSTRUCTIONS_CMDID);
+	if (ret) {
+		ath11k_warn(ar->ab, "failed to send WMI_BPF_DEL_VDEV_INSTRUCTIONS_CMDID: %d\n", ret);
+		dev_kfree_skb(skb);
+	}
+	return ret;
+}
+
+/*
+ * M52XQ v246: the stock driver (qcacld, Android APF) does not use SET_VDEV_INSTRUCTIONS: it disables APF, writes the
+ * program into the firmware work memory (WMI_BPF_SET_VDEV_WORK_MEMORY) and enables APF again (WMI_BPF_SET_VDEV_ENABLE).
+ * That engine runs the Android APF programs, which expect an Ethernet (802.3) frame.
+ */
+int ath11k_wmi_apf_enable(struct ath11k *ar, u32 vdev_id, bool enable)
+{
+	struct {
+		u32 tlv_header;
+		u32 vdev_id;
+		u32 is_enabled;
+	} __packed *cmd;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = ath11k_wmi_alloc_skb(ar->wmi->wmi_ab, sizeof(*cmd));
+	if (!skb)
+		return -ENOMEM;
+	cmd = (void *)skb->data;
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_BPF_SET_VDEV_ENABLE_CMD) |
+			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->vdev_id = vdev_id;
+	cmd->is_enabled = enable;
+
+	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "apf enable vdev %d %d\n", vdev_id, enable);
+	ret = ath11k_wmi_cmd_send(ar->wmi, skb, WMI_BPF_SET_VDEV_ENABLE_CMDID);
+	if (ret) {
+		ath11k_warn(ar->ab, "failed to send WMI_BPF_SET_VDEV_ENABLE_CMDID: %d\n", ret);
+		dev_kfree_skb(skb);
+	}
+	return ret;
+}
+
+int ath11k_wmi_apf_write_memory(struct ath11k *ar, u32 vdev_id, u32 version, const u8 *prog, u32 len)
+{
+	struct {
+		u32 tlv_header;
+		u32 vdev_id;
+		u32 bpf_version;
+		u32 program_len;
+		u32 addr_offset;
+		u32 length;
+	} __packed *cmd;
+	struct wmi_tlv *tlv;
+	struct sk_buff *skb;
+	u32 aligned = roundup(len, 4);
+	int ret;
+
+	skb = ath11k_wmi_alloc_skb(ar->wmi->wmi_ab, sizeof(*cmd) + TLV_HDR_SIZE + aligned);
+	if (!skb)
+		return -ENOMEM;
+	cmd = (void *)skb->data;
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_BPF_SET_VDEV_WORK_MEMORY_CMD) |
+			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->vdev_id = vdev_id;
+	cmd->bpf_version = version;
+	cmd->program_len = len;
+	cmd->addr_offset = 0;
+	cmd->length = len;
+	tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
+	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) | FIELD_PREP(WMI_TLV_LEN, aligned);
+	memset(tlv->value, 0, aligned);
+	memcpy(tlv->value, prog, len);
+
+	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "apf write memory vdev %d version %u len %u\n", vdev_id, version, len);
+	ret = ath11k_wmi_cmd_send(ar->wmi, skb, WMI_BPF_SET_VDEV_WORK_MEMORY_CMDID);
+	if (ret) {
+		ath11k_warn(ar->ab, "failed to send WMI_BPF_SET_VDEV_WORK_MEMORY_CMDID: %d\n", ret);
+		dev_kfree_skb(skb);
+	}
+	return ret;
+}
+
 int ath11k_wmi_wow_enable(struct ath11k *ar)
 {
 	struct wmi_wow_enable_cmd *cmd;
@@ -9378,7 +9567,13 @@ int ath11k_wmi_wow_enable(struct ath11k *ar)
 
 	cmd->enable = 1;
 	cmd->pause_iface_config = WOW_IFACE_PAUSE_ENABLED;
-	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "tlv wow enable\n");
+	/*
+	 * M52XQ: the vendor driver (qcacld pmo_core_enable_wow_in_fw) sets WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW for a system
+	 * suspend, to tell the firmware this is not a runtime-PM WoW; without it the WCN6750 firmware never raised the
+	 * host wake interrupt (WOW_REASON_UNSPECIFIED on resume, no wake from ping/magic packet).
+	 */
+	cmd->flags = m52xq_wow_flags; /* v227: run-time knob, default 0xe0 like the stock driver */
+	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "tlv wow enable flags 0x%x\n", cmd->flags);
 
 	ret = ath11k_wmi_cmd_send(ar->wmi, skb, WMI_WOW_ENABLE_CMDID);
 	if (ret) {

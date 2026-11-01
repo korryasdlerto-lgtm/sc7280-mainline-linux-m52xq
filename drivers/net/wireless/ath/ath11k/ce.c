@@ -889,7 +889,11 @@ void ath11k_ce_rx_post_buf(struct ath11k_base *ab)
 
 	for (i = 0; i < ab->hw_params.ce_count; i++) {
 		pipe = &ab->ce.ce_pipe[i];
+		ath11k_dbg(ab, ATH11K_DBG_BOOT,
+			   "diag ce rx pipe %d begin\n", i);
 		ret = ath11k_ce_rx_post_pipe(pipe);
+		ath11k_dbg(ab, ATH11K_DBG_BOOT,
+			   "diag ce rx pipe %d ret %d\n", i, ret);
 		if (ret) {
 			if (ret == -ENOSPC)
 				continue;

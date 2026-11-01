@@ -28,6 +28,10 @@
 #include "pm_helpers.h"
 #include "hfi_venus_io.h"
 
+/* M52XQ: 1 = allocate/free one 4K secure buffer at probe (diagnostic, needs the video-secure-nonpixel DT node) */
+static bool m52xq_sec_selftest;
+module_param(m52xq_sec_selftest, bool, 0444);
+
 static void venus_coredump(struct venus_core *core)
 {
 	struct device *dev;
@@ -457,6 +461,21 @@ static int venus_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_runtime_disable;
 
+	/* M52XQ: optional secure non-pixel context for the encoder (failure is not fatal) */
+	ret = venus_secure_init(core);
+	if (ret)
+		dev_warn(dev, "M52SEC: init failed (%d), encoder PERSIST stays non-secure\n", ret);
+	else if (m52xq_sec_selftest && core->sec.dev) {
+		struct venus_sec_buf sb;
+		int r = venus_secure_alloc(core, SZ_4K, &sb);
+
+		dev_info(dev, "M52SEC: selftest alloc ret=%d\n", r);
+		if (!r) {
+			venus_secure_free(core, &sb);
+			dev_info(dev, "M52SEC: selftest free done\n");
+		}
+	}
+
 	ret = venus_boot(core);
 	if (ret)
 		goto err_firmware_deinit;
@@ -514,6 +533,7 @@ err_core_deinit:
 err_venus_shutdown:
 	venus_shutdown(core);
 err_firmware_deinit:
+	venus_secure_deinit(core);
 	venus_firmware_deinit(core);
 err_runtime_disable:
 	pm_runtime_put_noidle(dev);
@@ -545,6 +565,7 @@ static void venus_remove(struct platform_device *pdev)
 	venus_shutdown(core);
 	of_platform_depopulate(dev);
 
+	venus_secure_deinit(core);
 	venus_firmware_deinit(core);
 
 	venus_remove_dynamic_nodes(core);
@@ -570,6 +591,7 @@ static void venus_core_shutdown(struct platform_device *pdev)
 
 	pm_runtime_get_sync(core->dev);
 	venus_shutdown(core);
+	venus_secure_deinit(core);
 	venus_firmware_deinit(core);
 	pm_runtime_put_sync(core->dev);
 }

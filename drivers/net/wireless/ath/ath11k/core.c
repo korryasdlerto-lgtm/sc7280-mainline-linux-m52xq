@@ -2134,25 +2134,31 @@ static int ath11k_core_start(struct ath11k_base *ab)
 {
 	int ret;
 
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag core start begin\n");
+
 	ret = ath11k_wmi_attach(ab);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag wmi attach ret %d\n", ret);
 	if (ret) {
 		ath11k_err(ab, "failed to attach wmi: %d\n", ret);
 		return ret;
 	}
 
 	ret = ath11k_htc_init(ab);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag htc init ret %d\n", ret);
 	if (ret) {
 		ath11k_err(ab, "failed to init htc: %d\n", ret);
 		goto err_wmi_detach;
 	}
 
 	ret = ath11k_hif_start(ab);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag hif start ret %d\n", ret);
 	if (ret) {
 		ath11k_err(ab, "failed to start HIF: %d\n", ret);
 		goto err_wmi_detach;
 	}
 
 	ret = ath11k_htc_wait_target(&ab->htc);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag htc wait target ret %d\n", ret);
 	if (ret) {
 		ath11k_err(ab, "failed to connect to HTC: %d\n", ret);
 		goto err_hif_stop;
@@ -2297,8 +2303,11 @@ int ath11k_core_qmi_firmware_ready(struct ath11k_base *ab)
 	if (ath11k_frame_mode == ATH11K_HW_TXRX_RAW)
 		set_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags);
 
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag core lock begin\n");
 	mutex_lock(&ab->core_lock);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag core lock acquired\n");
 	ret = ath11k_core_start(ab);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag core start ret %d\n", ret);
 	if (ret) {
 		ath11k_err(ab, "failed to start core: %d\n", ret);
 		goto err_dp_free;

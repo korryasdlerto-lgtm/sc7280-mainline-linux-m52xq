@@ -5,6 +5,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/iommu.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
@@ -353,6 +354,12 @@ static int venus_alloc(struct venus_hfi_device *hdev, struct mem_desc *desc,
 				    desc->attrs);
 	if (!desc->kva)
 		return -ENOMEM;
+	{
+		struct iommu_domain *d = iommu_get_domain_for_dev(dev);
+		phys_addr_t pa = d ? iommu_iova_to_phys(d, desc->da) : 0;
+
+		pr_info("M52DBG hfi-mem da=%pad size=%zu dom=%p type=%d phys=%pa\n", &desc->da, desc->size, d, d ? d->type : -1, &pa);
+	}
 
 	return 0;
 }

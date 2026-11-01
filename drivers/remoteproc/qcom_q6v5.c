@@ -15,6 +15,7 @@
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/smem_state.h>
 #include <linux/remoteproc.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
 #include "qcom_common.h"
 #include "qcom_q6v5.h"
 
@@ -206,7 +207,14 @@ static irqreturn_t q6v5_handover_interrupt(int irq, void *data)
 	if (q6v5->handover)
 		q6v5->handover(q6v5);
 
-	icc_set_bw(q6v5->path, 0, 0);
+	/*
+	 * M52XQ: once interconnect sync_state has run nothing else holds the
+	 * APPS -> LPASS core config path, and the ADSP then fails the LPASS
+	 * core HW vote (AFE cmd 0x100f4) -> no LPASS clocks, no sound. Keep
+	 * the vote while the DSP runs; it is dropped in unprepare.
+	 */
+	if (!q6v5->keep_icc_vote)
+		icc_set_bw(q6v5->path, 0, 0);
 
 	return IRQ_HANDLED;
 }
@@ -266,6 +274,10 @@ unsigned long qcom_q6v5_panic(struct qcom_q6v5 *q6v5)
 }
 EXPORT_SYMBOL_GPL(qcom_q6v5_panic);
 
+static bool m52xq_icc_active_only = true;
+module_param(m52xq_icc_active_only, bool, 0444);
+MODULE_PARM_DESC(m52xq_icc_active_only, "Exclude the kept LPASS interconnect vote from the RPMh SLEEP set");
+
 /**
  * qcom_q6v5_init() - initializer of the q6v5 common struct
  * @q6v5:	handle to be initialized
@@ -292,6 +304,24 @@ int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
 
 	init_completion(&q6v5->start_done);
 	init_completion(&q6v5->stop_done);
+
+	/*
+	 * M52XQ: get the interconnect path before mapping any IRQ -- a probe
+	 * deferred on the path after the PDC wdog IRQ was mapped came back
+	 * with "IRQ wdog not found" (-ENXIO) and the ADSP never registered.
+	 */
+	q6v5->path = devm_of_icc_get(&pdev->dev, NULL);
+	if (IS_ERR(q6v5->path))
+		return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->path),
+				     "failed to acquire interconnect path\n");
+	q6v5->keep_icc_vote = of_property_read_bool(pdev->dev.of_node,
+						    "qcom,keep-interconnect-vote");
+	/*
+	 * M52XQ: the kept APPS -> LPASS vote (peak = UINT_MAX) has the default tag ALWAYS, so it also lands in the RPMh
+	 * SLEEP set and keeps the bus up while the system sleeps; keep it for ACTIVE/WAKE only.
+	 */
+	if (q6v5->keep_icc_vote && m52xq_icc_active_only)
+		icc_set_tag(q6v5->path, QCOM_ICC_TAG_ACTIVE_ONLY);
 
 	q6v5->wdog_irq = platform_get_irq_byname(pdev, "wdog");
 	if (q6v5->wdog_irq < 0)
@@ -380,10 +410,6 @@ int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
 		return load_state ? -ENOMEM : -EINVAL;
 	}
 
-	q6v5->path = devm_of_icc_get(&pdev->dev, NULL);
-	if (IS_ERR(q6v5->path))
-		return dev_err_probe(&pdev->dev, PTR_ERR(q6v5->path),
-				     "failed to acquire interconnect path\n");
 
 	return 0;
 }

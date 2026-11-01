@@ -10,6 +10,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
+#include <linux/interconnect.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
 #include <linux/kernel.h>
@@ -1608,12 +1609,45 @@ static const struct of_device_id qcom_pas_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, qcom_pas_of_match);
 
+/*
+ * M52XQ: the APPS -> LPASS core config interconnect vote (peak = UINT_MAX, kept while the ADSP runs, qcom,keep-interconnect-vote)
+ * keeps the NoC chain busy and may stop the SoC from reaching AOSD/CXSD/DDR sleep. Drop it for the system sleep and vote again
+ * on resume (the vote is only needed when the ADSP starts an audio session).
+ */
+static bool m52xq_adsp_icc_suspend; /* default off: dropping the LPASS vote at suspend woke the system at once and broke the audio card */
+module_param(m52xq_adsp_icc_suspend, bool, 0644);
+
+static int qcom_pas_suspend(struct device *dev)
+{
+	struct qcom_pas *pas = dev_get_drvdata(dev);
+
+	if (m52xq_adsp_icc_suspend && pas->q6v5.keep_icc_vote && pas->rproc->state == RPROC_RUNNING) {
+		icc_set_bw(pas->q6v5.path, 0, 0);
+		dev_info(dev, "M52XQ: LPASS interconnect vote dropped for system sleep\n");
+	}
+
+	return 0;
+}
+
+static int qcom_pas_resume(struct device *dev)
+{
+	struct qcom_pas *pas = dev_get_drvdata(dev);
+
+	if (m52xq_adsp_icc_suspend && pas->q6v5.keep_icc_vote && pas->rproc->state == RPROC_RUNNING)
+		icc_set_bw(pas->q6v5.path, 0, UINT_MAX);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(qcom_pas_pm_ops, qcom_pas_suspend, qcom_pas_resume);
+
 static struct platform_driver qcom_pas_driver = {
 	.probe = qcom_pas_probe,
 	.remove = qcom_pas_remove,
 	.driver = {
 		.name = "qcom_q6v5_pas",
 		.of_match_table = qcom_pas_of_match,
+		.pm = pm_sleep_ptr(&qcom_pas_pm_ops),
 	},
 };
 

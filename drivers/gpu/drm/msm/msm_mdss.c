@@ -54,11 +54,10 @@ static int msm_mdss_parse_data_bus_icc_path(struct device *dev,
 	struct icc_path *reg_bus_path;
 
 	path0 = devm_of_icc_get(dev, "mdp0-mem");
-	if (IS_ERR_OR_NULL(path0))
-		return PTR_ERR_OR_ZERO(path0);
-
-	msm_mdss->mdp_path[0] = path0;
-	msm_mdss->num_mdp_paths = 1;
+	if (!IS_ERR_OR_NULL(path0)) {
+		msm_mdss->mdp_path[0] = path0;
+		msm_mdss->num_mdp_paths = 1;
+	}
 
 	path1 = devm_of_icc_get(dev, "mdp1-mem");
 	if (!IS_ERR_OR_NULL(path1)) {

@@ -615,6 +615,7 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
 	u32 phy_type;
 	int ret;
 
+
 	phy = devm_kzalloc(dev, sizeof(*phy), GFP_KERNEL);
 	if (!phy)
 		return -ENOMEM;

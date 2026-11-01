@@ -12,6 +12,7 @@
 #include "core.h"
 #include "debug.h"
 #include "hif.h"
+#include "pcic.h"
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/ioport.h>
@@ -1713,6 +1714,7 @@ int ath11k_qmi_host_cap_send(struct ath11k_base *ab)
 	struct qmi_wlanfw_host_cap_req_msg_v01 req;
 	struct qmi_wlanfw_host_cap_resp_msg_v01 resp;
 	struct qmi_txn txn;
+	bool internal_sleep_clock;
 	int ret = 0;
 
 	memset(&req, 0, sizeof(req));
@@ -1740,7 +1742,19 @@ int ath11k_qmi_host_cap_send(struct ath11k_base *ab)
 	req.cal_done_valid = 1;
 	req.cal_done = ab->qmi.cal_done;
 
-	if (ab->hw_params.internal_sleep_clock) {
+	/*
+	 * WCN6750 normally expects the platform's external LF clock.  Some
+	 * downstream DTBs do not describe that clock to ath11k, so allow a
+	 * board-specific override without changing the default for other boards.
+	 */
+	internal_sleep_clock = ab->hw_params.internal_sleep_clock ||
+		of_property_read_bool(ab->dev->of_node,
+				      "qcom,ath11k-internal-sleep-clock");
+
+	if (internal_sleep_clock) {
+		if (!ab->hw_params.internal_sleep_clock)
+			ath11k_info(ab, "using DT-selected internal sleep clock\n");
+
 		req.nm_modem_valid = 1;
 
 		/* Notify firmware that this is non-qualcomm platform. */
@@ -3235,6 +3249,18 @@ static void ath11k_qmi_driver_event_work(struct work_struct *work)
 			set_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags);
 			set_bit(ATH11K_FLAG_RECOVERY, &ab->dev_flags);
 
+			/* m52xq: on WCN6750 (AHB + pcic irqs) a firmware crash is recovered by remoteproc, not by
+			 * ath11k_core_reset(), so nobody disabled the ext irqs: they stayed armed while the DP rings
+			 * were freed and re-created, and ath11k_core_qmi_firmware_ready() enabled them a second
+			 * time ("Unbalanced enable for IRQ 216..226", 2026-10-24). Disable them here so that enable
+			 * is balanced; the reset path has already disabled them and cleared the flag. The same for
+			 * the CE irqs, which ath11k_pcic_start() enables again (IRQ 206..212).
+			 */
+			if (test_bit(ATH11K_FLAG_EXT_IRQ_ENABLED, &ab->dev_flags))
+				ath11k_hif_irq_disable(ab);
+			if (test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
+				ath11k_pcic_ce_irq_disable_sync(ab);
+
 			if (!ab->is_reset)
 				ath11k_core_pre_reconfigure_recovery(ab);
 			break;
@@ -3295,8 +3321,14 @@ static void ath11k_qmi_driver_event_work(struct work_struct *work)
 			clear_bit(ATH11K_FLAG_CRASH_FLUSH,
 				  &ab->dev_flags);
 			clear_bit(ATH11K_FLAG_RECOVERY, &ab->dev_flags);
-			ath11k_core_qmi_firmware_ready(ab);
-			set_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags);
+			if (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags)) {
+				ret = ath11k_core_qmi_firmware_ready(ab);
+				if (ret) {
+					set_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags);
+					break;
+				}
+				set_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags);
+			}
 
 			break;
 		case ATH11K_QMI_EVENT_COLD_BOOT_CAL_DONE:

@@ -8,6 +8,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_graph.h>
@@ -147,6 +148,7 @@ struct msm_dsi_host {
 	spinlock_t intr_lock; /* Protect interrupt ctrl register */
 
 	u32 err_work_state;
+	u32 err_fifo_status;
 	struct work_struct err_work;
 	struct workqueue_struct *workqueue;
 
@@ -1458,9 +1460,9 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 		ret = wait_for_completion_timeout(&msm_host->dma_comp,
 					msecs_to_jiffies(200));
 		DBG("ret=%d", ret);
-		if (ret == 0)
+		if (ret == 0) {
 			ret = -ETIMEDOUT;
-		else
+		} else
 			ret = len;
 	} else {
 		ret = len;
@@ -1568,7 +1570,9 @@ static void dsi_err_worker(struct work_struct *work)
 		container_of(work, struct msm_dsi_host, err_work);
 	u32 status = msm_host->err_work_state;
 
-	pr_err_ratelimited("%s: status=%x\n", __func__, status);
+	pr_err_ratelimited("%s: status=%x fifo=%08x\n", __func__, status,
+			   msm_host->err_fifo_status);
+	msm_host->err_fifo_status = 0;
 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
 
@@ -1631,6 +1635,7 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
 	if (status) {
 		dsi_write(msm_host, REG_DSI_FIFO_STATUS, status);
 		msm_host->err_work_state |= DSI_ERR_STATE_FIFO;
+		msm_host->err_fifo_status |= status;
 		if (status & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW)
 			msm_host->err_work_state |=
 					DSI_ERR_STATE_MDP_FIFO_UNDERFLOW;
@@ -1762,18 +1767,63 @@ static int dsi_host_detach(struct mipi_dsi_host *host,
 	return 0;
 }
 
+/*
+ * M52XQ: on a command mode panel a DCS command sent while the MDP streams a
+ * frame starves the HS lanes (FIFO_STATUS = HS_FIFO_UNDERFLOW on all lanes)
+ * and corrupts the frame, e.g. async backlight updates while the compositor
+ * repaints. Like downstream's panel_lock, serialize DCS commands with frame
+ * kickoffs: the DPU command mode encoder marks a frame busy from CTL_START
+ * until pp_done, commands wait for no busy frame, and a kickoff waits for an
+ * in-flight command to finish.
+ */
+static DEFINE_MUTEX(msm_dsi_frame_lock);
+static atomic_t msm_dsi_frames_busy = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(msm_dsi_frame_wq);
+
+void msm_dsi_cmd_frame_begin(void)
+{
+	mutex_lock(&msm_dsi_frame_lock);
+	atomic_inc(&msm_dsi_frames_busy);
+	mutex_unlock(&msm_dsi_frame_lock);
+}
+
+void msm_dsi_cmd_frame_end(void)
+{
+	atomic_add_unless(&msm_dsi_frames_busy, -1, 0);
+	wake_up_all(&msm_dsi_frame_wq);
+}
+
+void msm_dsi_cmd_frame_reset(void)
+{
+	atomic_set(&msm_dsi_frames_busy, 0);
+	wake_up_all(&msm_dsi_frame_wq);
+}
+
 static ssize_t dsi_host_transfer(struct mipi_dsi_host *host,
 					const struct mipi_dsi_msg *msg)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	bool cmd_mode;
 	int ret;
 
 	if (!msg || !msm_host->power_on)
 		return -EINVAL;
 
+	cmd_mode = !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO);
+	if (cmd_mode) {
+		mutex_lock(&msm_dsi_frame_lock);
+		if (!wait_event_timeout(msm_dsi_frame_wq,
+					!atomic_read(&msm_dsi_frames_busy),
+					msecs_to_jiffies(50)))
+			atomic_set(&msm_dsi_frames_busy, 0);
+	}
+
 	mutex_lock(&msm_host->cmd_mutex);
 	ret = msm_dsi_manager_cmd_xfer(msm_host->id, msg);
 	mutex_unlock(&msm_host->cmd_mutex);
+
+	if (cmd_mode)
+		mutex_unlock(&msm_dsi_frame_lock);
 
 	return ret;
 }

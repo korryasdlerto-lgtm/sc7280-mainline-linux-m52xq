@@ -11,6 +11,47 @@
 #include <linux/pm_opp.h>
 #include <soc/qcom/cmd-db.h>
 #include <soc/qcom/tcs.h>
+
+/* M52XQ: 1 = never call dev_pm_opp_set_opp() on the GPU device (downstream DT node has
+ * clocks + interconnects but no opp-peak-kBps -> OPP core touches gcc clk and votes 0 bw) */
+/* M52XQ: 1 = force-clear GMU_GPU_NAP_CTRL.HW_NAP_ENABLE (downstream DT: qcom,no-nap) */
+static bool m52xq_nap_off = false;
+module_param(m52xq_nap_off, bool, 0444);
+
+/* M52XQ: limit GPU OPPs to the downstream speed-bin table (a642L) */
+static bool m52xq_speedbin_limit = true;
+module_param(m52xq_speedbin_limit, bool, 0444);
+static uint m52xq_gpu_fmax_mhz;
+module_param(m52xq_gpu_fmax_mhz, uint, 0444);
+
+static bool m52xq_no_gpu_opp = true;
+module_param(m52xq_no_gpu_opp, bool, 0444);
+
+/* M52XQ: 1 = downstream kgsl RSC sleep sequence on GMU shutdown (SYSRESET + RSC sleep, PDC_SLEEP set),
+ * so the next a6xx_rpmh_start() really performs the RSC wake sequence */
+static bool m52xq_rsc_sleep = true;
+module_param(m52xq_rsc_sleep, bool, 0644);
+
+/* M52XQ: 1 = set GPU_CC_GX_GDSCR.RETAIN_FF_ENABLE (bit 11) on every GMU resume, before fw start.
+ * gpucc lives in the CX domain: its GX_GDSCR resets to default when CX collapses, and the
+ * mainline GX gdsc has a do-nothing power_on, so nobody restores the retention bit (downstream
+ * GX gdsc has qcom,retain-regs). */
+/* M52XQ: 1 = clear GPU_CC_GX_CBCR bits 13/14 (memory retain, set by m52xq_gx_retain() after the first successful GPU start)
+ * before every GMU restart, so that the GMU boots from the first-boot state (0x...221) */
+static bool m52xq_gx_cbcr_clear = true;
+module_param(m52xq_gx_cbcr_clear, bool, 0644);
+static bool m52xq_gx_retain_resume;
+module_param(m52xq_gx_retain_resume, bool, 0644);
+
+/* M52XQ: 1 = on every GMU resume start from the highest perf level (as at first boot), instead of
+ * the (lower) level devfreq left behind while idle; at first boot perf index 3 / 550 MHz works,
+ * after resume index 1 / 315 MHz does not */
+static bool m52xq_resume_max_freq;
+module_param(m52xq_resume_max_freq, bool, 0644);
+
+/* M52XQ: 1 = trace every GMU start/stop (register dumps, RSC/SLUMBER/FREQ); dumps on a failed OOB stay always on */
+static bool m52xq_gmu_trace;
+module_param(m52xq_gmu_trace, bool, 0644);
 #include <drm/drm_gem.h>
 
 #include "a6xx_gpu.h"
@@ -219,9 +260,12 @@ void a6xx_gmu_set_freq(struct msm_gpu *gpu, struct dev_pm_opp *opp,
 		return;
 
 	if (!gmu->legacy) {
-		a6xx_hfi_set_freq(gmu, perf_index, bw_index);
+		ret = a6xx_hfi_set_freq(gmu, perf_index, bw_index);
+		if (ret)
+			DRM_DEV_ERROR(gmu->dev, "M52XQ: HFI set_freq(perf %u, bw 0x%x) failed: %d\n",
+				      perf_index, bw_index, ret);
 		/* With Bandwidth voting, we now vote for all resources, so skip OPP set */
-		if (!bw_index)
+		if (!bw_index && !m52xq_no_gpu_opp)
 			dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
 		return;
 	}
@@ -314,16 +358,17 @@ static int a6xx_gmu_start(struct a6xx_gmu *gmu)
 	else if (adreno_is_a7xx(adreno_gpu))
 		gmu_write(gmu, REG_A7XX_GMU_GENERAL_9, 0);
 	else
-		gmu_write(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_RESP, 0);
+		gmu_write(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_RESP, gmu->m52xq_log_wptr);
 
 
 	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 0);
 
 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, val,
-		(val & mask) == reset_val, 100, 10000);
+		(val & mask) == reset_val, 100, 100000);
 
-	if (ret)
+	if (ret) {
 		DRM_DEV_ERROR(gmu->dev, "GMU firmware initialization timed out\n");
+	}
 
 	set_bit(GMU_STATUS_FW_START, &gmu->status);
 
@@ -389,6 +434,86 @@ static const struct a6xx_gmu_oob_bits a6xx_gmu_oob_bits[] = {
 	},
 };
 
+static int m52xq_dump_ok = 3;
+
+static bool m52xq_log_pending = true;
+
+/* dump the GMU firmware's own log buffer (gmu->log, 16K): non-empty 32-byte rows as hex + ASCII */
+static void m52xq_gmu_log_dump(struct a6xx_gmu *gmu)
+{
+	const u8 *p = gmu->log.virt;
+	size_t off, i, rows = 0;
+	char asc[33];
+
+	if (!p || !m52xq_log_pending)
+		return;
+	m52xq_log_pending = false;
+
+	pr_err("M52XQ-GMULOG: start size=%zu iova=0x%llx\n", gmu->log.size, (unsigned long long)gmu->log.iova);
+	for (off = 0; off + 32 <= gmu->log.size && rows < 500; off += 32) {
+		const u32 *w = (const u32 *)(p + off);
+		bool empty = true;
+
+		for (i = 0; i < 8; i++)
+			if (w[i] && w[i] != 0xffffffff)
+				empty = false;
+		if (empty)
+			continue;
+		for (i = 0; i < 32; i++)
+			asc[i] = (p[off + i] >= 0x20 && p[off + i] < 0x7f) ? p[off + i] : '.';
+		asc[32] = 0;
+		pr_err("M52XQ-GMULOG[%04zx]: %08x %08x %08x %08x %08x %08x %08x %08x |%s|\n", off,
+		       w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], asc);
+		rows++;
+	}
+	pr_err("M52XQ-GMULOG: end rows=%zu\n", rows);
+}
+
+
+static void m52xq_gmu_dump(struct a6xx_gmu *gmu, const char *tag)
+{
+	if (!m52xq_gmu_trace && strcmp(tag, "FAIL"))
+		return;
+	pr_err("M52XQ-OOB-%s: status=0x%lx RPMH_PWR=0x%08x SPTPRAC=0x%08x CX_BUSY=0x%08x FW_INIT=0x%08x SYSRESET=0x%08x SPARE=0x%08x HFI_CTRL=0x%08x GX_GDSCR=0x%08x GX_MISC=0x%08x MISC3=0x%08x CX_GDSCR=0x%08x RSC0=0x%08x SEQ=0x%08x INTR=0x%08x\n",
+	       tag, gmu->status,
+	       gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
+	       gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS),
+	       gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS),
+	       gmu_read(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT),
+	       gmu_read(gmu, REG_A6XX_GMU_CM3_SYSRESET),
+	       gmu_read(gmu, REG_A6XX_GMU_AO_SPARE_CNTL),
+	       gmu_read(gmu, REG_A6XX_GMU_HFI_CTRL_STATUS),
+	       gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR),
+	       gmu_read(gmu, REG_A6XX_GPU_CC_GX_DOMAIN_MISC),
+	       gmu_read(gmu, 0x24563),	/* downstream GPU_CC_GX_DOMAIN_MISC3 (gpucc+0x158c) */
+	       gmu_read(gmu, 0x2441B),	/* downstream GPU_CC_CX_GDSCR */
+	       gmu_read_rscc(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_BUSY_DRV0),
+	       gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
+
+	/* RSC (rscc) state that a6xx_gmu_rpmh_init() programs ONCE (pdc_in_aop: only RSCC regs) */
+	pr_err("M52XQ-RSCC-%s: SLAVE_ID=0x%x TCS0 D/A=%x/%x D2/A2=%x/%x D4/A4=%x/%x OVR=0x%x PDC_SEQ=0x%x MATCH LO/HI=0x%x/0x%x SEQMEM=%08x %08x %08x %08x %08x\n",
+	       tag,
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_PDC_SLAVE_ID_DRV0),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_DATA), gmu_read_rscc(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_DATA + 2), gmu_read_rscc(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 2),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_DATA + 4), gmu_read_rscc(gmu, REG_A6XX_RSCC_HIDDEN_TCS_CMD0_ADDR + 4),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_OVERRIDE_START_ADDR), gmu_read_rscc(gmu, REG_A6XX_RSCC_PDC_SEQ_START_ADDR),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_PDC_MATCH_VALUE_LO), gmu_read_rscc(gmu, REG_A6XX_RSCC_PDC_MATCH_VALUE_HI),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0), gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 1),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 2), gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 3),
+	       gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_MEM_0_DRV0 + 4));
+
+	/* gpucc @0x3d90000 is visible in the GMU window: dword = 0x24000 + gpucc_byte/4 */
+	pr_err("M52XQ-CLK-%s: PLL0 mode=0x%08x L=0x%08x USER=0x%08x STATUS=0x%08x OPMODE=0x%08x | PLL1 mode=0x%08x L=0x%08x USER=0x%08x STATUS=0x%08x OPMODE=0x%08x | GX_CBCR=0x%08x CMD(101c)=0x%08x CFG(1020)=0x%08x\n",
+	       tag,
+	       gmu_read(gmu, 0x24000), gmu_read(gmu, 0x24001), gmu_read(gmu, 0x24004),
+	       gmu_read(gmu, 0x2400c), gmu_read(gmu, 0x2400e),
+	       gmu_read(gmu, 0x24040), gmu_read(gmu, 0x24041), gmu_read(gmu, 0x24044),
+	       gmu_read(gmu, 0x2404c), gmu_read(gmu, 0x2404e),
+	       gmu_read(gmu, 0x24415), gmu_read(gmu, 0x24407), gmu_read(gmu, 0x24408));
+}
+
 /* Trigger a OOB (out of band) request to the GMU */
 int a6xx_gmu_set_oob(struct a6xx_gmu *gmu, enum a6xx_gmu_oob_state state)
 {
@@ -419,15 +544,28 @@ int a6xx_gmu_set_oob(struct a6xx_gmu *gmu, enum a6xx_gmu_oob_state state)
 				      a6xx_gmu_oob_bits[state].name);
 			return -EINVAL;
 		}
+		/*
+		 * M52XQ: downstream KGSL uses a third, "intermediate" OOB bit
+		 * convention (same bit for both set and check, offset by 16)
+		 * instead of the 30/31 scheme, whenever the GMU firmware's own
+		 * reported HFI version has its low 5 bits == 0. Mainline never
+		 * queries the firmware version on this path and always assumes
+		 * 30/31 for non-legacy chips -- test the downstream fallback
+		 * for GPU_SET specifically, since our exact signed firmware
+		 * blob's real HFI version is unknown until queried live.
+		 */
+		if (state == GMU_OOB_GPU_SET && (gmu->hfi_fw_version & 0x1F) == 0) {
+			request = 16;
+			ack = 16;
+		}
 	}
 
-	/* Trigger the equested OOB operation */
 	gmu_write(gmu, REG_A6XX_GMU_HOST2GMU_INTR_SET, 1 << request);
 
 	do {
 		/* Wait for the acknowledge interrupt */
 		ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO, val,
-			val & (1 << ack), 100, 10000);
+			val & (1 << ack), 100, 100000);
 
 		if (!ret)
 			break;
@@ -442,11 +580,33 @@ int a6xx_gmu_set_oob(struct a6xx_gmu *gmu, enum a6xx_gmu_oob_state state)
 		wait_for_completion(&a6xx_gpu->base.fault_coredump_done);
 	} while (true);
 
-	if (ret)
+	if (ret) {
 		DRM_DEV_ERROR(gmu->dev,
 			"Timeout waiting for GMU OOB set %s: 0x%x\n",
 				a6xx_gmu_oob_bits[state].name,
 				gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO));
+
+		/* M52XQ: one-shot diagnostics (first 4 timeouts) */
+		{
+			static int m52xq_oob_diag;
+
+			if (m52xq_oob_diag++ < 4)
+				m52xq_gmu_dump(gmu, "FAIL");
+			m52xq_gmu_log_dump(gmu);
+			if (m52xq_oob_diag <= 4)
+				pr_err("M52XQ-OOB-BITS: state=%d legacy=%d hfi_fw_version=0x%08x request=%d ack=%d\n",
+				       state, gmu->legacy, gmu->hfi_fw_version, request, ack);
+		}
+	}
+
+	/* M52XQ: baseline dump of a SUCCESSFUL GPU_SET (first 3 after boot, 1 after each RSC wake) */
+	if (!ret && state == GMU_OOB_GPU_SET && m52xq_dump_ok > 0) {
+		m52xq_dump_ok--;
+		m52xq_gmu_dump(gmu, "OK");
+		if (m52xq_gmu_trace)
+			pr_err("M52XQ-OOB-BITS-OK: state=%d legacy=%d hfi_fw_version=0x%08x request=%d ack=%d\n",
+		       state, gmu->legacy, gmu->hfi_fw_version, request, ack);
+	}
 
 	/* Clear the acknowledge interrupt */
 	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, 1 << ack);
@@ -483,8 +643,6 @@ int a6xx_sptprac_enable(struct a6xx_gmu *gmu)
 {
 	int ret;
 	u32 val;
-
-	WARN_ON(!gmu->legacy);
 
 	/* Nothing to do if GMU does the power management */
 	if (gmu->idle_level > GMU_IDLE_STATE_ACTIVE)
@@ -612,6 +770,16 @@ static int a6xx_rpmh_start(struct a6xx_gmu *gmu)
 	if (!test_and_clear_bit(GMU_STATUS_PDC_SLEEP, &gmu->status))
 		return 0;
 
+	if (m52xq_rsc_sleep) {
+		m52xq_dump_ok = 1;
+		m52xq_log_pending = true;
+	}
+
+	if (m52xq_rsc_sleep && m52xq_gmu_trace)
+		pr_err("M52XQ-RSC: wake seq start: STATUS0=0x%08x SEQ_BUSY=0x%08x\n",
+		       gmu_read_rscc(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
+		       gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_BUSY_DRV0));
+
 	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, BIT(1));
 
 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_RSCC_CONTROL_ACK, val,
@@ -642,11 +810,24 @@ static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
 	int ret;
 	u32 val;
 
-	if (test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status))
+	bool fw_started = test_and_clear_bit(GMU_STATUS_FW_START, &gmu->status);
+
+	if (m52xq_rsc_sleep ? !fw_started : fw_started)
 		return;
 
 	if (adreno_is_a840(adreno_gpu))
 		bitmask = BIT(30);
+
+	if (m52xq_rsc_sleep) {
+		/* downstream a6xx_rscc_sleep_sequence(): hold the M3 in reset first */
+		gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
+		wmb();
+		gmu->m52xq_log_wptr = gmu_read(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_RESP);
+		if (m52xq_gmu_trace)
+			pr_err("M52XQ-RSC: sleep seq start: STATUS0=0x%08x SEQ_BUSY=0x%08x\n",
+		       gmu_read_rscc(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
+		       gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_BUSY_DRV0));
+	}
 
 	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 1);
 
@@ -656,6 +837,11 @@ static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
 		DRM_DEV_ERROR(gmu->dev, "Unable to power off the GPU RSC\n");
 
 	gmu_write(gmu, REG_A6XX_GMU_RSCC_CONTROL_REQ, 0);
+
+	if (m52xq_rsc_sleep && m52xq_gmu_trace)
+		pr_err("M52XQ-RSC: sleep seq done: ret=%d STATUS0=0x%08x SEQ_BUSY=0x%08x\n", ret,
+		       gmu_read_rscc(gmu, REG_A6XX_GPU_RSCC_RSC_STATUS0_DRV0),
+		       gmu_read_rscc(gmu, REG_A6XX_RSCC_SEQ_BUSY_DRV0));
 
 	set_bit(GMU_STATUS_PDC_SLEEP, &gmu->status);
 }
@@ -830,6 +1016,11 @@ static void a6xx_gmu_power_config(struct a6xx_gmu *gmu)
 			A6XX_GMU_PWR_COL_INTER_FRAME_CTRL_SPTPRAC_POWER_CONTROL_ENABLE);
 	}
 
+	/* M52XQ: downstream DT has qcom,no-nap; show and force-clear HW NAP */
+	if (m52xq_nap_off) {
+		gmu_rmw(gmu, REG_A6XX_GMU_GPU_NAP_CTRL, 0x1, 0);
+	}
+
 	/* Enable RPMh GPU client */
 	gmu_rmw(gmu, REG_A6XX_GMU_RPMH_CTRL, 0,
 		A6XX_GMU_RPMH_CTRL_RPMH_INTERFACE_ENABLE |
@@ -954,6 +1145,7 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
 	ret = a6xx_rpmh_start(gmu);
 	if (ret)
 		return ret;
+	m52xq_gmu_dump(gmu, "AFTER-RSC");
 
 	if (state == GMU_COLD_BOOT) {
 		if (WARN(!adreno_gpu->fw[ADRENO_FW_GMU],
@@ -964,6 +1156,8 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
 		if (ret)
 			return ret;
 	}
+
+	m52xq_gmu_dump(gmu, "AFTER-FWLOAD");
 
 	/* Clear init result to make sure we are getting a fresh value */
 	gmu_write(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, 0);
@@ -1036,10 +1230,18 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
 		gmu_write(gmu, REG_A6XX_GMU_MRC_GBIF_QOS_CTRL, 0x33);
 	}
 
+	/* M52XQ: downstream clears a stale GBIF halt before booting the GMU */
+	if (a6xx_has_gbif(adreno_gpu)) {
+		gpu_write(gpu, REG_A6XX_GBIF_HALT, 0);
+		gpu_read(gpu, REG_A6XX_GBIF_HALT);
+	}
+
 	/* Set up the lowest idle level on the GMU */
 	a6xx_gmu_power_config(gmu);
 
+	m52xq_gmu_dump(gmu, "BEFORE-START");
 	ret = a6xx_gmu_start(gmu);
+	m52xq_gmu_dump(gmu, "AFTER-START");
 	if (ret)
 		return ret;
 
@@ -1142,14 +1344,13 @@ static void a6xx_gmu_force_off(struct a6xx_gmu *gmu)
 	/* Force off SPTP in case the GMU is managing it */
 	a6xx_sptprac_disable(gmu);
 
-	a6xx_gemnoc_workaround(gmu);
-
 	/* Make sure there are no outstanding RPMh votes */
 	a6xx_gmu_rpmh_off(gmu);
 
 	/* Clear the WRITEDROPPED fields and put fence into allow mode */
 	gmu_write(gmu, REG_A6XX_GMU_AHB_FENCE_STATUS_CLR, 0x7);
 	gmu_write(gmu, REG_A6XX_GMU_AO_AHB_FENCE_CTRL, 0);
+	a6xx_gemnoc_workaround(gmu);
 
 	/* Make sure the above writes go through */
 	wmb();
@@ -1171,11 +1372,17 @@ static void a6xx_gmu_set_initial_freq(struct msm_gpu *gpu, struct a6xx_gmu *gmu)
 	unsigned long gpu_freq = gmu->gpu_freqs[gmu->current_perf_index];
 
 	gpu_opp = dev_pm_opp_find_freq_exact(&gpu->pdev->dev, gpu_freq, true);
-	if (IS_ERR(gpu_opp))
+	if (IS_ERR(gpu_opp)) {
+		/* M52XQ: was a silent return, i.e. no initial frequency vote reached the GMU */
+		DRM_DEV_ERROR(gmu->dev, "M52XQ: no OPP for initial freq %lu (perf index %u): no initial vote sent\n",
+			      gpu_freq, gmu->current_perf_index);
 		return;
+	}
 
 	gmu->freq = 0; /* so a6xx_gmu_set_freq() doesn't exit early */
 	a6xx_gmu_set_freq(gpu, gpu_opp, false);
+	if (m52xq_gmu_trace)
+		pr_err("M52XQ-FREQ: initial vote sent: freq=%lu perf_index=%u\n", gpu_freq, gmu->current_perf_index);
 	dev_pm_opp_put(gpu_opp);
 }
 
@@ -1183,6 +1390,17 @@ static void a6xx_gmu_set_initial_bw(struct msm_gpu *gpu, struct a6xx_gmu *gmu)
 {
 	struct dev_pm_opp *gpu_opp;
 	unsigned long gpu_freq = gmu->gpu_freqs[gmu->current_perf_index];
+
+	if (m52xq_no_gpu_opp) {
+		static struct icc_path *m52xq_gpu_icc;
+
+		/* explicit peak DDR vote on the GPU path (index 0 of the GPU node "interconnects") */
+		if (IS_ERR_OR_NULL(m52xq_gpu_icc))
+			m52xq_gpu_icc = of_icc_get_by_index(&gpu->pdev->dev, 0);
+		if (!IS_ERR_OR_NULL(m52xq_gpu_icc))
+			icc_set_bw(m52xq_gpu_icc, 0, kBps_to_icc(8532000));
+		return;
+	}
 
 	gpu_opp = dev_pm_opp_find_freq_exact(&gpu->pdev->dev, gpu_freq, true);
 	if (IS_ERR(gpu_opp))
@@ -1289,6 +1507,9 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 	/* Read the slice info on A8x GPUs */
 	a8xx_gpu_get_slice_info(gpu);
 
+	if (m52xq_resume_max_freq)
+		gmu->current_perf_index = gmu->nr_gpu_freqs - 1;
+
 	/* Set the bus quota to a reasonable value for boot */
 	a6xx_gmu_set_initial_bw(gpu, gmu);
 
@@ -1311,6 +1532,27 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 		 */
 		status = GMU_COLD_BOOT;
 	}
+
+	if (m52xq_gx_retain_resume) {
+		u32 before = gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR);
+
+		gmu_rmw(gmu, REG_A6XX_GPU_CC_GX_GDSCR, 0, BIT(11));
+		if (m52xq_gmu_trace)
+			pr_err("M52XQ-GXRET: GX_GDSCR 0x%08x -> 0x%08x\n", before,
+		       gmu_read(gmu, REG_A6XX_GPU_CC_GX_GDSCR));
+	}
+
+	if (m52xq_gx_cbcr_clear) {
+		/* gpucc + 0x1054 (GX_CBCR) is dword 0x24415 in the GMU window */
+		u32 cbcr = gmu_read(gmu, 0x24415);
+
+		gmu_rmw(gmu, 0x24415, BIT(13) | BIT(14), 0);
+		if (m52xq_gmu_trace)
+			pr_err("M52XQ-GXCBCR: before GMU restart 0x%08x -> 0x%08x\n", cbcr, gmu_read(gmu, 0x24415));
+	}
+
+	/* M52XQ: state right before the GMU is booted (compare first boot vs after sleep) */
+	m52xq_gmu_dump(gmu, "PRE");
 
 	ret = a6xx_gmu_fw_start(gmu, status);
 	if (ret)
@@ -1343,6 +1585,25 @@ rpm_put:
 	pm_runtime_put(gmu->dev);
 
 	return ret;
+}
+
+/*
+ * M52XQ variant A: genpd powers the CX domain off at system suspend once all its attached
+ * devices (GMU, SMMU, ...) are "suspended", even though the GPU was never runtime-suspended;
+ * the GMU then comes back in power-on-reset state (RPMH_POWER_STATE=0xf, SYSRESET=1, FW_INIT=0).
+ * Marking the GMU (and GX virtual) device as syscore makes the PM core skip their noirq
+ * callbacks, so genpd never counts them as suspended and keeps CX/GX on.
+ */
+void a6xx_gmu_m52xq_syscore(struct a6xx_gpu *a6xx_gpu, bool on)
+{
+	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
+
+	if (!gmu->initialized)
+		return;
+
+	dev_pm_syscore_device(gmu->dev, on);
+	if (!IS_ERR_OR_NULL(gmu->gxpd))
+		dev_pm_syscore_device(gmu->gxpd, on);
 }
 
 bool a6xx_gmu_isidle(struct a6xx_gmu *gmu)
@@ -1396,10 +1657,23 @@ static void a6xx_gmu_shutdown(struct a6xx_gmu *gmu)
 	if (ret)
 		goto force_off;
 
+	/*
+	 * M52XQ: the stock driver (adreno_a6xx_gmu.c a6xx_gmu_wait_for_idle) polls CX_BUSY_STATUS bit 30 (CXGXCPUBUSYIGNAHB)
+	 * to zero after PREPARE_SLUMBER, mainline only bit 23 (GPUBUSYIGNAHB): at the failed wake-up CX_BUSY was 0x71000000
+	 * (bit 30 set, bit 23 clear) -> CX/GX/CPU were still busy when the power was taken away.
+	 */
+	if (m52xq_gmu_trace)
+		pr_err("M52XQ-SLUMBER: PREPARE_SLUMBER done, CX_BUSY=0x%08x STATUS2=0x%08x\n",
+	       gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS),
+	       gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS2));
 	ret = gmu_poll_timeout(gmu,
 		REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS, val,
-		!(val & A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS_GPUBUSYIGNAHB),
-		100, 10000);
+		!(val & (A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS_GPUBUSYIGNAHB | BIT(30))),
+		100, 100000);
+	if (m52xq_gmu_trace)
+		pr_err("M52XQ-SLUMBER: wait CX idle ret=%d CX_BUSY=0x%08x STATUS2=0x%08x\n", ret,
+	       gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS),
+	       gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS2));
 
 	/*
 	 * Let the user know we failed to slumber but don't worry too
@@ -1448,7 +1722,8 @@ int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
 		a6xx_gmu_shutdown(gmu);
 
 	/* Remove the bus vote */
-	dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
+	if (!m52xq_no_gpu_opp)
+		dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
 
 	/*
 	 * Make sure the GX domain is off before turning off the GMU (CX)
@@ -1909,6 +2184,42 @@ static int a6xx_gmu_pwrlevels_probe(struct a6xx_gmu *gmu)
 		gmu->gmu_freqs, ARRAY_SIZE(gmu->gmu_freqs));
 
 	/*
+	 * M52XQ: the downstream DT (qcom,gpu-pwrlevel-bins) limits a642L by speed bin:
+	 * bin 0/172 -> 700 MHz, 117/129 -> 550 MHz, 96 -> 450 MHz; 608/812 MHz are never used.
+	 * GX clock dies at unsupported levels, so disable OPPs above the bin limit.
+	 */
+	if (m52xq_speedbin_limit) {
+		unsigned long f, fmax = 450000000;
+		struct dev_pm_opp *opp;
+		u32 fuse = 0xffffffff;
+		int r;
+
+		r = adreno_read_speedbin(&gpu->pdev->dev, &fuse);
+		if (!r) {
+			if (fuse == 0 || fuse == 172)
+				fmax = 700000000;
+			else if (fuse == 117 || fuse == 129)
+				fmax = 550000000;
+			else if (fuse == 96)
+				fmax = 450000000;
+		}
+		if (m52xq_gpu_fmax_mhz)
+			fmax = (unsigned long)m52xq_gpu_fmax_mhz * 1000000;
+		for (f = fmax + 1; ; f++) {
+			opp = dev_pm_opp_find_freq_ceil(&gpu->pdev->dev, &f);
+			if (IS_ERR(opp))
+				break;
+			dev_pm_opp_put(opp);
+			if (f == 608000000 || f > fmax) {
+				dev_pm_opp_disable(&gpu->pdev->dev, f);
+			}
+		}
+		/* 608 MHz is not in any downstream bin table */
+		if (fmax >= 608000000)
+			dev_pm_opp_disable(&gpu->pdev->dev, 608000000);
+	}
+
+	/*
 	 * The GMU also handles GPU frequency switching so build a list
 	 * from the GPU OPP table
 	 */
@@ -2240,8 +2551,9 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
 	struct resource *res;
 	int ret;
 
-	if (!pdev)
+	if (!pdev) {
 		return -ENODEV;
+	}
 
 	gmu->dev = &pdev->dev;
 

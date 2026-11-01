@@ -611,6 +611,8 @@ static const struct of_device_id qcom_pdm_domains[] __maybe_unused = {
 	{ .compatible = "qcom,sm7150", .data = sm7150_domains, },
 	{ .compatible = "qcom,sm7225", .data = sm6350_domains, },
 	{ .compatible = "qcom,sm7325", .data = sc7280_domains, },
+	/* M52XQ: Samsung DTBO overrides the root compatible to qcom,yupik-idp/qcom,yupik */
+	{ .compatible = "qcom,yupik", .data = sc7280_domains, },
 	{ .compatible = "qcom,sm8150", .data = sm8150_domains, },
 	{ .compatible = "qcom,sm8250", .data = sm8250_domains, },
 	{ .compatible = "qcom,sm8350", .data = sm8350_domains, },

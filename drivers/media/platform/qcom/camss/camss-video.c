@@ -19,7 +19,9 @@
 #include "camss.h"
 
 #define CAMSS_FRAME_MIN_WIDTH		1
-#define CAMSS_FRAME_MAX_WIDTH		8191
+/* m52xq: 16383 (was 8191): the 9248 px full frame of the S5KGW3 goes through the RDI raw dump, whose write
+ * master does not use the width (MIPI_RAW mode: frames written back to back, frame_inc = bytesperline * height) */
+#define CAMSS_FRAME_MAX_WIDTH		16383
 #define CAMSS_FRAME_MIN_HEIGHT		1
 #define CAMSS_FRAME_MAX_HEIGHT_RDI	8191
 #define CAMSS_FRAME_MAX_HEIGHT_PIX	4096

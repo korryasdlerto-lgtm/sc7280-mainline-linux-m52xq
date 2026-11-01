@@ -183,6 +183,19 @@ struct venus_format {
  * @ocs:	OF changeset pointer
  * @hwmode_dev:	a flag indicating that HW_CTRL_TRIGGER is used in clock driver
  */
+struct venus_sec_buf {
+	struct page **pages;
+	unsigned int npages;
+	size_t size;
+	dma_addr_t da;
+};
+
+struct venus_core;
+int venus_secure_init(struct venus_core *core);
+void venus_secure_deinit(struct venus_core *core);
+int venus_secure_alloc(struct venus_core *core, size_t size, struct venus_sec_buf *b);
+void venus_secure_free(struct venus_core *core, struct venus_sec_buf *b);
+
 struct venus_core {
 	void __iomem *base;
 	void __iomem *vbif_base;
@@ -216,6 +229,12 @@ struct venus_core {
 		phys_addr_t mem_phys;
 		size_t mem_size;
 	} fw;
+	/* M52XQ: secure non-pixel context (SID 0x2184) for the encoder's PERSIST buffer */
+	struct {
+		struct device *dev;
+		struct iommu_domain *dom;
+		struct gen_pool *pool;
+	} sec;
 	struct mutex lock;
 	struct list_head instances;
 	atomic_t insts_count;

@@ -295,6 +295,13 @@ config QCOM_PBS
 	  This module provides the APIs to the client drivers that wants to send the
 	  PBS trigger event to the PBS RAM.
 
+config M52XQ_ICP
+	tristate "M52XQ camera ICP (A5) driver"
+	depends on ARCH_QCOM && IOMMU_API
+	help
+	  First-generation camera ICP (A5) on SM7325: firmware boot, HFI queues,
+	  BPS/IPE sessions. Started on open of /dev/m52xq-icp.
+
 endmenu
 
 config QCOM_UBWC_CONFIG

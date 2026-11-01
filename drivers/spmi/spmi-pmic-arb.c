@@ -1918,6 +1918,7 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 		return PTR_ERR(intr);
 
 	irq = of_irq_get_byname(node, "periph_irq");
+	pr_err("CP71-periph_irq-ret=%d\n", irq);
 	if (irq <= 0)
 		return irq ?: -ENXIO;
 
@@ -1930,19 +1931,24 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 
 	if (pmic_arb->ver_ops->get_bus_resources) {
 		ret = pmic_arb->ver_ops->get_bus_resources(pdev, node, bus);
-		if (ret)
+		if (ret) {
+			pr_err("CP72-get_bus_resources-failed-ret=%d\n", ret);
 			return ret;
+		}
 	}
 
 	ret = pmic_arb->ver_ops->init_apid(bus, bus_index);
-	if (ret)
+	if (ret) {
+		pr_err("CP73-init_apid-failed-ret=%d\n", ret);
 		return ret;
+	}
 
 	dev_dbg(&pdev->dev, "adding irq domain for bus %d\n", bus_index);
 
 	bus->domain = irq_domain_create_tree(of_fwnode_handle(node), &pmic_arb_irq_domain_ops, bus);
 	if (!bus->domain) {
 		dev_err(&pdev->dev, "unable to create irq_domain\n");
+		pr_err("CP74-irq_domain_create_tree-failed\n");
 		return -ENOMEM;
 	}
 
@@ -1953,10 +1959,14 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 	dev_set_name(&ctrl->dev, "spmi-%d", bus_index);
 
 	ret = devm_spmi_controller_add(dev, ctrl);
-	if (ret)
+	if (ret) {
+		pr_err("CP75-controller_add-failed-ret=%d\n", ret);
 		return ret;
+	}
 
 	pmic_arb->buses_available++;
+
+	pr_err("CP76-bus_init-SUCCESS\n");
 
 	return 0;
 }

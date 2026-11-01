@@ -72,4 +72,6 @@ struct dpu_hw_intr *dpu_hw_intr_init(struct drm_device *dev,
 				     void __iomem *addr,
 				     const struct dpu_mdss_cfg *m);
 
+struct dpu_kms;
+
 #endif

@@ -445,6 +445,98 @@ static const struct regulator_ops rpmh_regulator_xob_ops = {
  *
  * Return: 0 on success, or a negative error number on failure
  */
+/*
+ * Downstream devicetree nodes name regulators like "regulator-pm7325-l9"
+ * instead of upstream's "ldo9"/"smps1"/"bob". Recognize the downstream
+ * suffix ("-l9", "-s1", "-bob") as an alias so we don't have to rename
+ * nodes in the (bootloader-validated) vendor devicetree blob.
+ */
+static bool rpmh_vreg_name_matches(struct device_node *node, const char *mainline_name)
+{
+	const char *node_name = node->name;
+	const char *dash;
+	char type_ch;
+	const char *num_str;
+
+	if (of_node_name_eq(node, mainline_name))
+		return true;
+
+	dash = strrchr(node_name, '-');
+	if (!dash || !dash[1])
+		return false;
+	dash++;
+
+	if (!strcmp(mainline_name, "bob"))
+		return !strcmp(dash, "bob");
+
+	if (!strncmp(mainline_name, "ldo", 3)) {
+		type_ch = 'l';
+		num_str = mainline_name + 3;
+	} else if (!strncmp(mainline_name, "smps", 4)) {
+		type_ch = 's';
+		num_str = mainline_name + 4;
+	} else {
+		return false;
+	}
+
+	if (dash[0] != type_ch)
+		return false;
+
+	return !strcmp(dash + 1, num_str);
+}
+
+/*
+ * M52XQ: the downstream DTBO overlay pins some rpmh-regulator LDOs
+ * (observed: PM8350C LDO3, LDO7 -- LDO7 is the touchscreen IO/pull-up
+ * supply) to a fixed regulator-min/max-microvolt value that does NOT
+ * land exactly on this regulator's linear voltage step grid, e.g. LDO7
+ * wants 3300000uV on pmic5_pldo's 1504000uV + n*8000uV ladder --
+ * 3300000 falls between step 224 (3296000uV) and step 225 (3304000uV),
+ * so no exact selector exists.
+ *
+ * With min_uV==max_uV, of_get_regulation_constraints() sets apply_uV,
+ * and machine_constraints_voltage() tries to land on that EXACT value:
+ * regulator_map_voltage_linear_range() finds no valid selector for the
+ * [3300000,3300000] window, _regulator_do_set_voltage() fails,
+ * voltage_selector never leaves -ENOTRECOVERABLE, and
+ * devm_regulator_register() fails with -ENOTRECOVERABLE (-131). The
+ * regulator never appears in sysfs, and any consumer waiting on it
+ * (the touchscreen) is stuck in waiting_for_supplier forever.
+ *
+ * Snap an unreachable fixed request to the nearest achievable step
+ * (a few mV off target -- harmless for a logic/pull-up supply) instead
+ * of failing the whole regulator outright.
+ */
+static void rpmh_regulator_snap_unreachable_fixed_uV(struct rpmh_vreg *vreg,
+				struct regulator_init_data *init_data)
+{
+	const struct linear_range *r;
+	int min_uV = init_data->constraints.min_uV;
+	int i, nsteps, cand_uV, range_max_uV;
+
+	if (!min_uV || min_uV != init_data->constraints.max_uV)
+		return;
+
+	for (i = 0; i < vreg->rdesc.n_linear_ranges; i++) {
+		r = &vreg->rdesc.linear_ranges[i];
+		range_max_uV = r->min + (r->max_sel - r->min_sel) * r->step;
+
+		if (min_uV < r->min || min_uV > range_max_uV)
+			continue;
+
+		nsteps = DIV_ROUND_CLOSEST(min_uV - r->min, r->step);
+		cand_uV = r->min + nsteps * r->step;
+		if (cand_uV == min_uV)
+			return; /* already exactly representable */
+
+		pr_info("qcom-rpmh-regulator: %s: unreachable fixed %duV, snapping to nearest step %duV\n",
+			vreg->rdesc.name, min_uV, cand_uV);
+		init_data->constraints.min_uV = cand_uV;
+		init_data->constraints.max_uV = cand_uV;
+		return;
+	}
+}
+
 static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 			struct device_node *node, const char *pmic_id,
 			const struct rpmh_vreg_init_data *pmic_rpmh_data)
@@ -460,7 +552,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 	vreg->dev = dev;
 
 	for (rpmh_data = pmic_rpmh_data; rpmh_data->name; rpmh_data++)
-		if (of_node_name_eq(node, rpmh_data->name))
+		if (rpmh_vreg_name_matches(node, rpmh_data->name))
 			break;
 
 	if (!rpmh_data->name) {
@@ -511,6 +603,9 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 	init_data = of_get_regulator_init_data(dev, node, &vreg->rdesc);
 	if (!init_data)
 		return -ENOMEM;
+
+	if (rpmh_data->hw_data->regulator_type == VRM)
+		rpmh_regulator_snap_unreachable_fixed_uV(vreg, init_data);
 
 	if (rpmh_data->hw_data->regulator_type == XOB &&
 	    init_data->constraints.min_uV &&
@@ -1817,6 +1912,20 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
 
 		ret = rpmh_regulator_init_vreg(vreg, dev, node, pmic_id,
 						vreg_data);
+		if (ret == -EINVAL) {
+			/*
+			 * XXX(m52xq debug): downstream RSC nodes have extra
+			 * sibling children per physical rail ("-ao"/"-so"
+			 * always-on/sleep-only resource variants) that don't
+			 * exist in mainline's per-PMIC tables at all. Don't
+			 * abort the whole node over an unrecognized *extra*
+			 * child -- the real one is usually a sibling that
+			 * still matches fine.
+			 */
+			dev_dbg(dev, "%pOFn: skipping unrecognized child (probably a downstream -ao/-so variant)\n",
+				node);
+			continue;
+		}
 		if (ret < 0)
 			return ret;
 	}

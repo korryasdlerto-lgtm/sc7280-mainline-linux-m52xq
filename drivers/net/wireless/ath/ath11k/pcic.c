@@ -763,8 +763,11 @@ int ath11k_pcic_start(struct ath11k_base *ab)
 {
 	set_bit(ATH11K_FLAG_DEVICE_INIT_DONE, &ab->dev_flags);
 
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag ce irqs enable begin\n");
 	ath11k_pcic_ce_irqs_enable(ab);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag ce irqs enable done\n");
 	ath11k_ce_rx_post_buf(ab);
+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "diag ce rx post done\n");
 
 	return 0;
 }

@@ -1530,6 +1530,12 @@ static int swrm_reg_show(struct seq_file *s_file, void *data)
 DEFINE_SHOW_ATTRIBUTE(swrm_reg);
 #endif
 
+/* m52xq: see qcom_swrm_probe() */
+static void qcom_swrm_dispose_irq(void *data)
+{
+	irq_dispose_mapping((unsigned int)(uintptr_t)data);
+}
+
 static int qcom_swrm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1580,6 +1586,17 @@ static int qcom_swrm_probe(struct platform_device *pdev)
 	if (ctrl->irq < 0) {
 		ret = ctrl->irq;
 		goto err_init;
+	}
+	/*
+	 * m52xq: the IRQ is requested as IRQF_TRIGGER_RISING below while the DT says level-high, which
+	 * leaves the mapping with the edge type. On a rebind (ADSP restart, m52xq-audio-ssr) of_irq_get()
+	 * then fails with "type mismatch" and returns 0. Dispose of the mapping when the device is
+	 * released (registered before the devm IRQ request, so it runs after the IRQ is freed).
+	 */
+	if (ctrl->irq > 0) {
+		ret = devm_add_action(dev, qcom_swrm_dispose_irq, (void *)(uintptr_t)ctrl->irq);
+		if (ret)
+			goto err_init;
 	}
 
 	ctrl->hclk = devm_clk_get(dev, "iface");
@@ -1636,6 +1653,9 @@ static int qcom_swrm_probe(struct platform_device *pdev)
 
 	ctrl->wake_irq = of_irq_get(dev->of_node, 1);
 	if (ctrl->wake_irq > 0) {
+		ret = devm_add_action(dev, qcom_swrm_dispose_irq, (void *)(uintptr_t)ctrl->wake_irq);
+		if (ret)
+			goto err_init;
 		ret = devm_request_threaded_irq(dev, ctrl->wake_irq, NULL,
 						qcom_swrm_wake_irq_handler,
 						IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
@@ -1699,6 +1719,14 @@ static void qcom_swrm_remove(struct platform_device *pdev)
 
 	sdw_bus_master_delete(&ctrl->bus);
 	clk_disable_unprepare(ctrl->hclk);
+	/*
+	 * m52xq: probe enables runtime PM after sdw_bus_master_add(); left enabled here, a rebind
+	 * (ADSP restart, m52xq-audio-ssr) resumed the controller from inside sdw_bus_master_add()
+	 * before the bus was set up -> Oops in sdw_bus_exit_clk_stop().
+	 */
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
 }
 
 static int __maybe_unused swrm_runtime_resume(struct device *dev)

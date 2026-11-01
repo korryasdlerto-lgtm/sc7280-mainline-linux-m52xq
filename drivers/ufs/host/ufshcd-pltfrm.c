@@ -19,6 +19,10 @@
 #include "ufshcd-pltfrm.h"
 #include <ufs/unipro.h>
 
+/* M52XQ: UFS recovery trace, printed only while the error handler runs */
+extern bool m52xq_ufs_rectrace;
+#define M52_TR(fmt, ...) do { if (m52xq_ufs_rectrace) pr_info(fmt, ##__VA_ARGS__); } while (0)
+
 #define UFSHCD_DEFAULT_LANES_PER_DIRECTION		2
 
 static int ufshcd_parse_clock_info(struct ufs_hba *hba)
@@ -268,16 +272,20 @@ static int ufshcd_parse_operating_points(struct ufs_hba *hba)
 	const char **clk_names;
 	int cnt, i, ret;
 
-	if (!of_property_present(np, "operating-points-v2"))
+	if (!of_property_present(np, "operating-points-v2")) {
+		M52_TR("OPPPARSETRACE-A-no-operating-points-v2-property\n");
 		return 0;
+	}
 
 	if (of_property_present(np, "freq-table-hz")) {
 		dev_err(dev, "%s: operating-points and freq-table-hz are incompatible\n",
 			 __func__);
+		M52_TR("OPPPARSETRACE-B-freq-table-hz-conflict\n");
 		return -EINVAL;
 	}
 
 	cnt = of_property_count_strings(np, "clock-names");
+	M52_TR("OPPPARSETRACE-C-clock-names-cnt=%d\n", cnt);
 	if (cnt <= 0) {
 		dev_err(dev, "%s: Missing clock-names\n",  __func__);
 		return -ENODEV;
@@ -316,20 +324,24 @@ static int ufshcd_parse_operating_points(struct ufs_hba *hba)
 	config.config_clks = ufshcd_opp_config_clks;
 
 	ret = devm_pm_opp_set_config(dev, &config);
+	M52_TR("OPPPARSETRACE-D-set_config-ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	ret = devm_pm_opp_of_add_table(dev);
+	M52_TR("OPPPARSETRACE-E-of_add_table-ret=%d\n", ret);
 	if (ret) {
 		dev_err(dev, "Failed to add OPP table: %d\n", ret);
 		return ret;
 	}
 
 	ret = ufshcd_parse_clock_min_max_freq(hba);
+	M52_TR("OPPPARSETRACE-F-min_max_freq-ret=%d\n", ret);
 	if (ret)
 		return ret;
 
 	hba->use_pm_opp = true;
+	M52_TR("OPPPARSETRACE-G-SUCCESS-use_pm_opp=true\n");
 
 	return 0;
 }
@@ -534,7 +546,9 @@ int ufshcd_pltfrm_init(struct platform_device *pdev,
 		return err;
 	}
 
+	M52_TR("UFSTRACE-before-ufshcd_init\n");
 	err = ufshcd_init(hba, mmio_base, irq);
+	M52_TR("UFSTRACE-after-ufshcd_init-err=%d\n", err);
 	if (err) {
 		dev_err_probe(dev, err, "Initialization failed with error %d\n",
 			      err);

@@ -12,6 +12,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/qcom/geni-se.h>
@@ -118,6 +119,9 @@ struct geni_i2c_dev {
 	struct dma_chan *rx_c;
 	bool no_dma;
 	bool gpi_mode;
+	bool is_shared;
+	/* M52XQ: device whose IOMMU maps SE DMA buffers (the QUP wrapper) */
+	struct device *dma_dev;
 	bool abort_done;
 	bool is_tx_multi_desc_xfer;
 	u32 num_msgs;
@@ -544,12 +548,12 @@ static void geni_i2c_gpi_unmap(struct geni_i2c_dev *gi2c, struct i2c_msg *msg,
 			       void *rx_buf, dma_addr_t rx_addr)
 {
 	if (tx_buf) {
-		dma_unmap_single(gi2c->se.dev->parent, tx_addr, msg->len, DMA_TO_DEVICE);
+		dma_unmap_single(gi2c->dma_dev, tx_addr, msg->len, DMA_TO_DEVICE);
 		i2c_put_dma_safe_msg_buf(tx_buf, msg, !gi2c->err);
 	}
 
 	if (rx_buf) {
-		dma_unmap_single(gi2c->se.dev->parent, rx_addr, msg->len, DMA_FROM_DEVICE);
+		dma_unmap_single(gi2c->dma_dev, rx_addr, msg->len, DMA_FROM_DEVICE);
 		i2c_put_dma_safe_msg_buf(rx_buf, msg, !gi2c->err);
 	}
 }
@@ -644,8 +648,11 @@ static int geni_i2c_gpi(struct geni_i2c_dev *gi2c, struct i2c_msg msgs[],
 	 * programming an extra TX DMA TRE that would cause an unintended
 	 * write cycle on the I2C bus before the actual read operation.
 	 */
+	peripheral->link_ieob = false;
 	if (op == I2C_WRITE && msgs[msg_idx].flags & I2C_M_RD) {
 		peripheral->multi_msg = true;
+		/* M52XQ: retire this TX half by its own EOB (shared SEs use the unlock TRE) */
+		peripheral->link_ieob = !gi2c->is_shared;
 		goto skip_tx_dma_map;
 	}
 
@@ -660,9 +667,9 @@ static int geni_i2c_gpi(struct geni_i2c_dev *gi2c, struct i2c_msg msgs[],
 	else
 		map_dirn = DMA_FROM_DEVICE;
 
-	addr = dma_map_single(gi2c->se.dev->parent, dma_buf,
+	addr = dma_map_single(gi2c->dma_dev, dma_buf,
 			      msgs[msg_idx].len, map_dirn);
-	if (dma_mapping_error(gi2c->se.dev->parent, addr)) {
+	if (dma_mapping_error(gi2c->dma_dev, addr)) {
 		i2c_put_dma_safe_msg_buf(dma_buf, &msgs[msg_idx], false);
 		ret = -ENOMEM;
 		goto out;
@@ -679,8 +686,16 @@ skip_tx_dma_map:
 		flags = DMA_PREP_INTERRUPT | DMA_CTRL_ACK;
 	}
 
-	/* set the length as message for rx txn */
-	peripheral->rx_len = msgs[msg_idx].len;
+	/*
+	 * set the length as message for rx txn
+	 * M52XQ: a plain write carries rx_len 0 in its GO TRE, as downstream
+	 * i2c-msm-geni does (MSM_GPI_I2C_GO_TRE_DWORD2(0)); a non-zero value
+	 * made the shared SE wait for an RX buffer that never comes.
+	 */
+	if (op == I2C_WRITE && !(msgs[msg_idx].flags & I2C_M_RD) && gi2c->is_shared)
+		peripheral->rx_len = 0;
+	else
+		peripheral->rx_len = msgs[msg_idx].len;
 	peripheral->op = op;
 
 	ret = dmaengine_slave_config(dma_chan, config);
@@ -712,8 +727,14 @@ skip_tx_dma_map:
 		goto err_config;
 	}
 
-	desc->callback_result = i2c_gpi_cb_result;
-	desc->callback_param = gi2c;
+	/*
+	 * M52XQ: the EOB of the TX half of a read only frees its TREs; the
+	 * transfer completes on the RX EOT, so no callback here.
+	 */
+	if (!peripheral->link_ieob) {
+		desc->callback_result = i2c_gpi_cb_result;
+		desc->callback_param = gi2c;
+	}
 
 	if (!((msgs[msg_idx].flags & I2C_M_RD) && op == I2C_WRITE))
 		gi2c_gpi_xfer->msg_idx_cnt++;
@@ -753,7 +774,7 @@ skip_tx_dma_map:
 err_config:
 	/* Avoid DMA unmap as the write operation skipped DMA mapping */
 	if (dma_buf) {
-		dma_unmap_single(gi2c->se.dev->parent, addr,
+		dma_unmap_single(gi2c->dma_dev, addr,
 				 msgs[msg_idx].len, map_dirn);
 		i2c_put_dma_safe_msg_buf(dma_buf, &msgs[msg_idx], false);
 	}
@@ -832,6 +853,10 @@ static int geni_i2c_gpi_xfer(struct geni_i2c_dev *gi2c, struct i2c_msg msgs[], i
 		peripheral.addr = msgs[i].addr;
 		if (i > 0 && (!(msgs[i].flags & I2C_M_RD)))
 			peripheral.multi_msg = false;
+
+		/* M52XQ: shared SE, lock before the first and unlock after the last message */
+		peripheral.lock = gi2c->is_shared && i == 0;
+		peripheral.unlock = gi2c->is_shared && i == num - 1;
 
 		ret =  geni_i2c_gpi(gi2c, msgs, &config,
 				    &tx_addr, &tx_buf, I2C_WRITE, gi2c->tx_c);
@@ -922,7 +947,13 @@ static int geni_i2c_xfer(struct i2c_adapter *adap,
 		return ret;
 	}
 
-	qcom_geni_i2c_conf(gi2c);
+	/*
+	 * M52XQ: on a shared SE the other EE owns the SE clock/timing
+	 * registers; downstream GSI mode never writes them (timing goes in
+	 * the CONFIG0 TRE). Writing them from here silently reset the SoC.
+	 */
+	if (!gi2c->is_shared)
+		qcom_geni_i2c_conf(gi2c);
 
 	if (gi2c->gpi_mode)
 		ret = geni_i2c_gpi_xfer(gi2c, msgs, num);
@@ -995,6 +1026,7 @@ static int geni_i2c_probe(struct platform_device *pdev)
 {
 	struct geni_i2c_dev *gi2c;
 	u32 proto, tx_depth, fifo_disable;
+	bool shared;
 	int ret;
 	struct device *dev = &pdev->dev;
 	const struct geni_i2c_desc *desc = NULL;
@@ -1005,6 +1037,31 @@ static int geni_i2c_probe(struct platform_device *pdev)
 
 	gi2c->se.dev = dev;
 	gi2c->se.wrapper = dev_get_drvdata(dev->parent);
+	gi2c->dma_dev = dev->parent;
+	if (!gi2c->se.wrapper) {
+		/*
+		 * M52XQ: the extracted downstream DTB keeps the geni SE i2c
+		 * nodes as siblings of the qup wrapper (linked by a
+		 * "qcom,wrapper-core" phandle), not as its children, so
+		 * dev->parent is /soc, not the wrapper. Resolve the wrapper
+		 * from the phandle instead.
+		 */
+		struct device_node *wnp = of_parse_phandle(dev->of_node,
+							  "qcom,wrapper-core", 0);
+		if (wnp) {
+			struct platform_device *wpd = of_find_device_by_node(wnp);
+
+			of_node_put(wnp);
+			if (wpd) {
+				gi2c->se.wrapper = platform_get_drvdata(wpd);
+				/* map SE DMA buffers through the wrapper's IOMMU (SID) */
+				gi2c->dma_dev = &wpd->dev;
+				put_device(&wpd->dev);
+			}
+		}
+		if (!gi2c->se.wrapper)
+			return -EPROBE_DEFER;
+	}
 	gi2c->se.base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(gi2c->se.base))
 		return PTR_ERR(gi2c->se.base);
@@ -1083,8 +1140,19 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		dev_err_probe(dev, ret, "Error turning on resources\n");
 		goto err_clk;
 	}
+	/*
+	 * M52XQ: an SE marked "qcom,shared" (downstream multi-EE) is owned
+	 * jointly with another execution environment. Downstream only reads
+	 * it and talks to it through GPI DMA; never load SE firmware into it
+	 * or program it for FIFO mode (that silently reset the SoC).
+	 */
+	shared = of_property_read_bool(dev->of_node, "qcom,shared");
+
 	proto = geni_se_read_proto(&gi2c->se);
-	if (proto == GENI_SE_INVALID_PROTO) {
+	if (proto == GENI_SE_INVALID_PROTO && shared) {
+		ret = dev_err_probe(dev, -ENXIO, "shared SE has no I2C firmware\n");
+		goto err_resources;
+	} else if (proto == GENI_SE_INVALID_PROTO) {
 		ret = geni_load_se_firmware(&gi2c->se, GENI_SE_I2C);
 		if (ret) {
 			dev_err_probe(dev, ret, "i2c firmware load failed ret: %d\n", ret);
@@ -1095,9 +1163,19 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		goto err_resources;
 	}
 
-	if (desc && desc->no_dma_support) {
+	if ((desc && desc->no_dma_support) ||
+	    (!of_property_present(dev->of_node, "dmas") && !shared)) {
+		/*
+		 * M52XQ: the extracted downstream DTB's geni i2c nodes have no
+		 * GPI DMA wiring set up for mainline; force FIFO-only mode
+		 * (the HW FIFO_IF_DISABLE bit is set by fw but FIFO still works
+		 * for the small transfers a touch controller does).
+		 */
 		fifo_disable = false;
 		gi2c->no_dma = true;
+	} else if (shared) {
+		fifo_disable = true;
+		gi2c->is_shared = true;
 	} else {
 		fifo_disable = readl_relaxed(gi2c->se.base + GENI_IF_DISABLE_RO) & FIFO_IF_DISABLE;
 	}
@@ -1278,6 +1356,7 @@ static const struct geni_i2c_desc i2c_master_hub = {
 
 static const struct of_device_id geni_i2c_dt_match[] = {
 	{ .compatible = "qcom,geni-i2c" },
+	{ .compatible = "qcom,i2c-geni" }, /* M52XQ extracted downstream DTB */
 	{ .compatible = "qcom,geni-i2c-master-hub", .data = &i2c_master_hub },
 	{}
 };

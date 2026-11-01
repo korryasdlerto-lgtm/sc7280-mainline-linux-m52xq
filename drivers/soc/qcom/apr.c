@@ -52,6 +52,7 @@ struct apr_rx_buf {
  *
  * Return: Will be an negative on packet size on success.
  */
+
 int apr_send_pkt(struct apr_device *adev, struct apr_pkt *pkt)
 {
 	struct packet_router *apr = dev_get_drvdata(adev->dev.parent);

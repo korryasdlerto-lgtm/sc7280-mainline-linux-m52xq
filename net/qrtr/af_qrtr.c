@@ -9,6 +9,7 @@
 #include <linux/termios.h>	/* For TIOCINQ/OUTQ */
 #include <linux/spinlock.h>
 #include <linux/wait.h>
+#include <linux/pm_wakeup.h>
 
 #include <net/sock.h>
 
@@ -428,6 +429,72 @@ static void qrtr_node_assign(struct qrtr_node *node, unsigned int nid)
  *
  * Return: 0 on success; negative error code on failure
  */
+/*
+ * M52XQ: wake the system from s2idle for an incoming call / SMS. The modem talks to the AP all the time (any wakeup on the glink
+ * interrupt kept the phone awake: hundreds of events a minute), so only QMI indications of the VOICE (0x09) and WMS (0x05)
+ * services are reported as a hard wakeup event. The service of a (node, port) is learned from the NEW_SERVER control packets.
+ */
+#define M52XQ_SVC_WMS		0x05
+#define M52XQ_SVC_VOICE		0x09
+#define M52XQ_SRV_MAX		32
+
+static struct wakeup_source *m52xq_qrtr_ws;
+static struct { u32 node, port; } m52xq_srv[M52XQ_SRV_MAX];
+static int m52xq_srv_n;
+static DEFINE_SPINLOCK(m52xq_srv_lock);
+
+static bool m52xq_qrtr_wake = true;
+module_param(m52xq_qrtr_wake, bool, 0644);
+
+static int __init m52xq_qrtr_ws_init(void)
+{
+	m52xq_qrtr_ws = wakeup_source_register(NULL, "qrtr-voice-sms");
+	return 0;
+}
+late_initcall(m52xq_qrtr_ws_init);
+
+static void m52xq_qrtr_wake_filter(const struct qrtr_cb *cb, const u8 *payload, size_t size)
+{
+	unsigned long flags;
+	int i;
+
+	if (!m52xq_qrtr_wake || !m52xq_qrtr_ws)
+		return;
+
+	if (cb->type == QRTR_TYPE_NEW_SERVER) {
+		const struct qrtr_ctrl_pkt *pkt = (const void *)payload;
+		u32 service = le32_to_cpu(pkt->server.service);
+
+		if (service != M52XQ_SVC_WMS && service != M52XQ_SVC_VOICE)
+			return;
+
+		spin_lock_irqsave(&m52xq_srv_lock, flags);
+		for (i = 0; i < m52xq_srv_n; i++)
+			if (m52xq_srv[i].node == le32_to_cpu(pkt->server.node) &&
+			    m52xq_srv[i].port == le32_to_cpu(pkt->server.port))
+				break;
+		if (i == m52xq_srv_n && m52xq_srv_n < M52XQ_SRV_MAX) {
+			m52xq_srv[i].node = le32_to_cpu(pkt->server.node);
+			m52xq_srv[i].port = le32_to_cpu(pkt->server.port);
+			m52xq_srv_n++;
+		}
+		spin_unlock_irqrestore(&m52xq_srv_lock, flags);
+	} else if (cb->type == QRTR_TYPE_DATA && size >= 7 && payload[0] == 0x04 /* QMI indication */) {
+		bool hit = false;
+
+		spin_lock_irqsave(&m52xq_srv_lock, flags);
+		for (i = 0; i < m52xq_srv_n; i++)
+			if (m52xq_srv[i].node == cb->src_node && m52xq_srv[i].port == cb->src_port) {
+				hit = true;
+				break;
+			}
+		spin_unlock_irqrestore(&m52xq_srv_lock, flags);
+
+		if (hit)
+			pm_wakeup_ws_event(m52xq_qrtr_ws, 3000, true);
+	}
+}
+
 int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 {
 	struct qrtr_node *node = ep->node;
@@ -511,6 +578,8 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 	skb_put_data(skb, data + hdrlen, size);
 
 	qrtr_node_assign(node, cb->src_node);
+
+	m52xq_qrtr_wake_filter(cb, data + hdrlen, size);
 
 	if (cb->type == QRTR_TYPE_NEW_SERVER) {
 		/* Remote node endpoint can bridge other distant nodes */

@@ -21,6 +21,8 @@
 #define TRE_TYPE_IMMEDIATE_DMA	0x11
 #define TRE_TYPE_GO		0x20
 #define TRE_TYPE_CONFIG0	0x22
+#define TRE_TYPE_LOCK		0x30
+#define TRE_TYPE_UNLOCK		0x31
 
 /* TRE flags */
 #define TRE_FLAGS_CHAIN		BIT(0)
@@ -518,7 +520,7 @@ struct gpii {
 	bool ieob_set;
 };
 
-#define MAX_TRE 3
+#define MAX_TRE 5
 
 struct gpi_desc {
 	struct virt_dma_desc vd;
@@ -1631,6 +1633,18 @@ static int gpi_create_i2c_tre(struct gchan *chan, struct gpi_desc *desc,
 	struct gpi_tre *tre;
 	unsigned int i;
 
+	/* M52XQ: shared SE, acquire it for this EE first (chained) */
+	if (i2c->lock && direction == DMA_MEM_TO_DEV) {
+		tre = &desc->tre[tre_idx];
+		tre_idx++;
+
+		tre->dword[0] = 0;
+		tre->dword[1] = 0;
+		tre->dword[2] = 0;
+		tre->dword[3] = u32_encode_bits(TRE_TYPE_LOCK, TRE_FLAGS_TYPE);
+		tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_CHAIN);
+	}
+
 	/* first create config tre if applicable */
 	if (i2c->set_config) {
 		tre = &desc->tre[tre_idx];
@@ -1668,9 +1682,11 @@ static int gpi_create_i2c_tre(struct gchan *chan, struct gpi_desc *desc,
 
 		tre->dword[3] = u32_encode_bits(TRE_TYPE_GO, TRE_FLAGS_TYPE);
 
-		if (i2c->multi_msg)
+		if (i2c->multi_msg) {
 			tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_LINK);
-		else
+			if (i2c->link_ieob)
+				tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_IEOB);
+		} else
 			tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_CHAIN);
 	}
 
@@ -1690,6 +1706,33 @@ static int gpi_create_i2c_tre(struct gchan *chan, struct gpi_desc *desc,
 
 		if (!(flags & DMA_PREP_INTERRUPT))
 			tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_BEI);
+	}
+
+	/*
+	 * M52XQ: shared SE, release it at the end of the TX chain; chain the
+	 * preceding DMA TRE (not a linked GO) like downstream does.
+	 */
+	if (i2c->unlock && direction == DMA_MEM_TO_DEV) {
+		if (tre_idx && !(desc->tre[tre_idx - 1].dword[3] &
+				 u32_encode_bits(1, TRE_FLAGS_LINK)))
+			desc->tre[tre_idx - 1].dword[3] |=
+				u32_encode_bits(1, TRE_FLAGS_CHAIN);
+
+		tre = &desc->tre[tre_idx];
+		tre_idx++;
+
+		tre->dword[0] = 0;
+		tre->dword[1] = 0;
+		tre->dword[2] = 0;
+		tre->dword[3] = u32_encode_bits(TRE_TYPE_UNLOCK, TRE_FLAGS_TYPE);
+		/*
+		 * As downstream (msm_gpi.h UNLOCK dword3 ieob=1): the unlock
+		 * raises an EOB event, which completes this descriptor; the
+		 * chain's EOT on TX (and a linked RX EOT) are then only retired
+		 * by gpi_process_xfer_compl_event() via ieob_set.
+		 */
+		tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_IEOB);
+		chan->gpii->ieob_set = true;
 	}
 
 	for (i = 0; i < tre_idx; i++)
@@ -1825,6 +1868,11 @@ gpi_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 		nr_tre = 2;
 	if (direction == DMA_DEV_TO_MEM) /* rx */
 		nr_tre = 1;
+	if (gchan->protocol == QCOM_GPI_I2C && direction == DMA_MEM_TO_DEV) {
+		struct gpi_i2c_config *i2c = gchan->config;
+
+		nr_tre += i2c->lock + i2c->unlock;
+	}
 
 	/* calculate # of elements required & available */
 	nr = gpi_ring_num_elements_avail(ch_ring);

@@ -145,6 +145,12 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
 	cc->desc = desc;
 	cc->dev = dev;
 	q6dsp_clks = desc->clks;
+	/*
+	 * m52xq: set before the clocks are registered. After an ADSP restart (SSR) the consumers
+	 * (codec macros) still hold the clocks prepared; registering re-parents them and calls
+	 * .prepare right away, which dereferenced a NULL drvdata (Oops in clk_q6dsp_prepare).
+	 */
+	dev_set_drvdata(dev, cc);
 
 	for (i = 0; i < desc->num_clks; i++) {
 		unsigned int id = q6dsp_clks[i].clk_id;
@@ -177,8 +183,6 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
 	ret = devm_of_clk_add_hw_provider(dev, q6dsp_of_clk_hw_get, cc);
 	if (ret)
 		return ret;
-
-	dev_set_drvdata(dev, cc);
 
 	return 0;
 }

@@ -178,6 +178,16 @@ static const struct rmi_transport_ops rmi_i2c_ops = {
 #ifdef CONFIG_OF
 static const struct of_device_id rmi_i2c_of_match[] = {
 	{ .compatible = "syna,rmi4-i2c" },
+	/*
+	 * M52XQ: the downstream DTBO overlay (sda22, entry 4) overrides our
+	 * entry36 touchscreen@4b node's "compatible" back to the Samsung
+	 * sec_input value ("synaptics,synaptics_ts") no matter what we put
+	 * in the base DTB -- editing the DTBO itself risks Download Mode.
+	 * Match it here instead so the standard RMI4 driver still binds;
+	 * the node's other properties (syna,startup-delay-ms, rmi4-fXX
+	 * children) come from our base entry36 edit and survive the merge.
+	 */
+	{ .compatible = "synaptics,synaptics_ts" },
 	{},
 };
 MODULE_DEVICE_TABLE(of, rmi_i2c_of_match);

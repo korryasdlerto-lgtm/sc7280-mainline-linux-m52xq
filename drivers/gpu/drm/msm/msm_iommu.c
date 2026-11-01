@@ -726,12 +726,15 @@ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
 	struct msm_iommu *iommu;
 	int ret;
 
-	if (!device_iommu_mapped(dev))
+
+	if (!device_iommu_mapped(dev)) {
 		return ERR_PTR(-ENODEV);
+	}
 
 	domain = iommu_paging_domain_alloc(dev);
-	if (IS_ERR(domain))
+	if (IS_ERR(domain)) {
 		return ERR_CAST(domain);
+	}
 
 	iommu_set_pgtable_quirks(domain, quirks);
 
@@ -794,7 +797,7 @@ struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsig
 
 	/* Enable stall on iommu fault: */
 	if (adreno_smmu->set_stall)
-		adreno_smmu->set_stall(adreno_smmu->cookie, true);
+		adreno_smmu->set_stall(adreno_smmu->cookie, false); /* M52XQ: terminate mode */
 
 	return mmu;
 }

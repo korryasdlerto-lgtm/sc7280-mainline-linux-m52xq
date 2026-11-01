@@ -152,6 +152,12 @@ int qcom_snd_parse_of(struct snd_soc_card *card)
 				link->no_pcm = 1;
 				link->ignore_pmdown_time = 1;
 			}
+		} else if (platform) {
+			/* m52xq: DPCM backend without a codec (e.g. the in-call record AFE pseudo ports) */
+			link->codecs	 = &snd_soc_dummy_dlc;
+			link->num_codecs = 1;
+			link->no_pcm = 1;
+			link->ignore_pmdown_time = 1;
 		} else {
 			/* DPCM frontend */
 			link->codecs	 = &snd_soc_dummy_dlc;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2017-2018 The Linux Foundation. All rights reserved. */
 
+#include <linux/moduleparam.h>
 #include <linux/completion.h>
 #include <linux/circ_buf.h>
 #include <linux/list.h>
@@ -343,6 +344,8 @@ static int a6xx_hfi_send_perf_table(struct a6xx_gmu *gmu)
 		msg.gx_votes[i].vote = gmu->gx_arc_votes[i];
 		msg.gx_votes[i].acd = 0xffffffff;
 		msg.gx_votes[i].freq = gmu->gpu_freqs[i] / 1000;
+		pr_debug("M52XQ-PERF: gpu level %d freq=%u kHz gx_arc_vote=0x%08x\n", i,
+		       msg.gx_votes[i].freq, msg.gx_votes[i].vote);
 	}
 
 	for (i = 0; i < gmu->nr_gmu_freqs; i++) {
@@ -855,10 +858,17 @@ static int a6xx_hfi_feature_ctrl_msg(struct a6xx_gmu *gmu, u32 feature, u32 enab
 
 #define IFPC_LONG_HYST 0x1680
 
+/* M52XQ: 1 = explicitly tell GMU FW that IFPC is disabled when idle_level != IFPC */
+static bool m52xq_ifpc_off = false;
+module_param(m52xq_ifpc_off, bool, 0444);
+
 static int a6xx_hfi_enable_ifpc(struct a6xx_gmu *gmu)
 {
-	if (gmu->idle_level != GMU_IDLE_STATE_IFPC)
+	if (gmu->idle_level != GMU_IDLE_STATE_IFPC) {
+		if (m52xq_ifpc_off)
+			a6xx_hfi_feature_ctrl_msg(gmu, HFI_FEATURE_IFPC, 0, 0);
 		return 0;
+	}
 
 	return a6xx_hfi_feature_ctrl_msg(gmu, HFI_FEATURE_IFPC, 1, IFPC_LONG_HYST);
 }
@@ -976,6 +986,7 @@ int a6xx_hfi_start(struct a6xx_gmu *gmu, int boot_state)
 	if (gmu->legacy)
 		return a6xx_hfi_start_v1(gmu, boot_state);
 
+	ret = a6xx_hfi_get_fw_version(gmu, &gmu->hfi_fw_version);
 
 	ret = a6xx_hfi_send_perf_table(gmu);
 	if (ret)
@@ -1023,6 +1034,14 @@ void a6xx_hfi_stop(struct a6xx_gmu *gmu)
 
 		queue->header->read_index = 0;
 		queue->header->write_index = 0;
+
+		/* M52XQ: also restore the fields the GMU firmware may have changed (downstream re-inits the whole table) */
+		queue->header->status = 1;
+		queue->header->dropped = 0;
+		queue->header->rx_watermark = 1;
+		queue->header->tx_watermark = 1;
+		queue->header->rx_request = 1;
+		queue->header->tx_request = 0;
 
 		memset(&queue->history, 0xff, sizeof(queue->history));
 		queue->history_idx = 0;

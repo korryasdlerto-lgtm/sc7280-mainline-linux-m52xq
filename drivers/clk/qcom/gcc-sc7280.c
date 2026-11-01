@@ -13,6 +13,8 @@
 
 #include <dt-bindings/clock/qcom,gcc-sc7280.h>
 
+#include <linux/workqueue.h>
+
 #include "clk-alpha-pll.h"
 #include "clk-branch.h"
 #include "clk-rcg.h"
@@ -3454,6 +3456,24 @@ static const struct of_device_id gcc_sc7280_match_table[] = {
 };
 MODULE_DEVICE_TABLE(of, gcc_sc7280_match_table);
 
+/*
+ * M52XQ DIAGNOSTIC: core_clk_unipro's clk_get_parent() consistently
+ * reports a parent whose own clk_get_rate() is 19.2MHz (XO), even
+ * immediately after a "successful" clk_set_rate(300MHz) -- confirmed
+ * via CLKPARENTTRACE in ufshcd.c. Read GPLL0/GPLL0_OUT_EVEN's own
+ * rate directly (bypassing all consumer-side ambiguity) ~15s into
+ * boot, well after UFS has made its attempts, to see whether the PLL
+ * itself is actually running/locked at that point or not.
+ */
+static struct delayed_work m52xq_pll_check_work;
+
+static void m52xq_pll_check_fn(struct work_struct *work)
+{
+	pr_debug("PLLCHECKTRACE-gpll0-rate=%lu-gpll0_out_even-rate=%lu\n",
+	       clk_hw_get_rate(&gcc_gpll0.clkr.hw),
+	       clk_hw_get_rate(&gcc_gpll0_out_even.clkr.hw));
+}
+
 static int gcc_sc7280_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
@@ -3463,25 +3483,72 @@ static int gcc_sc7280_probe(struct platform_device *pdev)
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
-	/* Keep some clocks always-on */
-	qcom_branch_set_clk_en(regmap, 0x26004);/* GCC_CAMERA_AHB_CLK */
-	qcom_branch_set_clk_en(regmap, 0x26028);/* GCC_CAMERA_XO_CLK */
-	qcom_branch_set_clk_en(regmap, 0x27004);/* GCC_DISP_AHB_CLK */
-	qcom_branch_set_clk_en(regmap, 0x2701c);/* GCC_DISP_XO_CLK */
-	qcom_branch_set_clk_en(regmap, 0x28004);/* GCC_VIDEO_AHB_CLK */
-	qcom_branch_set_clk_en(regmap, 0x28014);/* GCC_VIDEO_XO_CLK */
-	qcom_branch_set_clk_en(regmap, 0x71004);/* GCC_GPU_CFG_AHB_CLK */
-	regmap_update_bits(regmap, 0x7100C, BIT(13), BIT(13));
+	/*
+	 * XXX(m52xq debug): the camera/disp/video/gpu AHB+XO "keep
+	 * always-on" branch-enable writes below hang this specific board
+	 * hard (whole CPU core wedged, confirmed via per-CPU heartbeat +
+	 * probe tracing -- GCC's own probe never returns, regardless of
+	 * every devicetree-side fix already tried). Very likely these
+	 * CBCR registers are TZ/XPU-protected on this device and a raw
+	 * HLOS regmap write to them locks up the bus. Skipped entirely
+	 * until camera/display/video/gpu bring-up is actually attempted.
+	 */
+
+	/*
+	 * m52xq camera bring-up experiment, only with the DT property
+	 * "m52xq,camera-ahb-on": read the CBCRs of GCC_CAMERA_AHB_CLK (0x26004) and
+	 * GCC_CAMERA_XO_CLK (0x26028) and write the enable bit ONLY when the
+	 * bootloader left them off (CLK_OFF = bit 31).  The unconditional "keep
+	 * always-on" writes hung this board in August; each step is logged so the
+	 * last line before a reset names the culprit.
+	 */
+	if (of_property_read_bool(pdev->dev.of_node, "m52xq,camera-ahb-on")) {
+		static const struct { u32 reg; const char *name; } cam[] = {
+			{ 0x26004, "GCC_CAMERA_AHB_CLK" },
+			{ 0x26028, "GCC_CAMERA_XO_CLK" },
+		};
+		unsigned int v, i;
+
+		for (i = 0; i < ARRAY_SIZE(cam); i++) {
+			regmap_read(regmap, cam[i].reg, &v);
+			pr_err("M52XQ-CAM: %s cbcr[%#x] = %#x (%s)\n", cam[i].name,
+			       cam[i].reg, v, (v & BIT(31)) ? "off" : "on");
+			if (v & BIT(31)) {
+				pr_err("M52XQ-CAM: enabling %s\n", cam[i].name);
+				regmap_update_bits(regmap, cam[i].reg, BIT(0), BIT(0));
+				regmap_read(regmap, cam[i].reg, &v);
+				pr_err("M52XQ-CAM: %s cbcr after = %#x\n", cam[i].name, v);
+			}
+		}
+	}
 
 	/* FORCE_MEM_CORE_ON for ufs phy ice core clocks */
 	qcom_branch_set_force_mem_core(regmap, gcc_ufs_phy_ice_core_clk, true);
+	/*
+	 * M52XQ EXPERIMENT: core_clk_unipro's clk_set_rate() consistently
+	 * reports success but the RCG mux never actually leaves XO/bypass
+	 * (measured via clk_get_rate() immediately after set, every boot).
+	 * Mainline has precedent for other Qualcomm SoCs needing this bit
+	 * on UFS-adjacent GCC clocks (e.g. gcc_ufs_axi_clk on 8650/8750) to
+	 * actually take effect. Trying it here as a targeted hypothesis.
+	 */
+	pr_debug("FORCEMEMTRACE-before-unipro-write\n");
+	qcom_branch_set_force_mem_core(regmap, gcc_ufs_phy_unipro_core_clk, true);
+	pr_debug("FORCEMEMTRACE-after-unipro-write\n");
 
 	ret = qcom_cc_register_rcg_dfs(regmap, gcc_dfs_clocks,
 			ARRAY_SIZE(gcc_dfs_clocks));
 	if (ret)
 		return ret;
 
-	return qcom_cc_really_probe(&pdev->dev, &gcc_sc7280_desc, regmap);
+	ret = qcom_cc_really_probe(&pdev->dev, &gcc_sc7280_desc, regmap);
+	if (ret)
+		return ret;
+
+	INIT_DELAYED_WORK(&m52xq_pll_check_work, m52xq_pll_check_fn);
+	schedule_delayed_work(&m52xq_pll_check_work, msecs_to_jiffies(15000));
+
+	return 0;
 }
 
 static struct platform_driver gcc_sc7280_driver = {

@@ -1460,6 +1460,14 @@ config REGULATOR_S2DOS05
 	  The S2DOS05 is a companion power management IC for the smart phones.
 	  The S2DOS05 has 4 LDOs and 1 BUCK outputs.
 
+config REGULATOR_S2MPB03
+	tristate "Samsung S2MPB03 camera PMIC regulators"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  This driver controls the seven LDOs of the Samsung S2MPB03 camera
+	  sensor PMIC (Galaxy M52 5G).
+
 config REGULATOR_S2MPA01
 	tristate "Samsung S2MPA01 voltage regulator"
 	depends on MFD_SEC_CORE || COMPILE_TEST

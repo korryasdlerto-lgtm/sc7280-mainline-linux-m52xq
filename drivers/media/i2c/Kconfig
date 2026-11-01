@@ -179,6 +179,42 @@ config VIDEO_IMX219
 	  To compile this driver as a module, choose M here: the
 	  module will be called imx219.
 
+config VIDEO_M52XQ_CAMSCAN
+	tristate "Galaxy M52 camera bring-up scanner (debug)"
+	help
+	  Debug helper that powers a camera sensor and scans its I2C bus.
+
+config VIDEO_FP5529
+	tristate "Fitipower FP5529 lens driver"
+	depends on I2C
+	help
+	  This is a driver for the Fitipower FP5529 voice coil motor
+	  used as an autofocus actuator.
+
+config VIDEO_IMX616
+	tristate "Sony IMX616 sensor support"
+	select V4L2_CCI_I2C
+	help
+	  This is a Video4Linux2 sensor driver for the Sony
+	  IMX616 camera.
+
+config VIDEO_S5KGW3
+	tristate "Samsung S5KGW3 sensor support"
+	select V4L2_CCI_I2C
+	help
+	  This is a Video4Linux2 sensor driver for the Samsung
+	  S5KGW3 camera.
+
+config VIDEO_GC5035
+	tristate "GalaxyCore GC5035 sensor support"
+	select V4L2_CCI_I2C
+	help
+	  This is a Video4Linux2 sensor driver for the GalaxyCore
+	  GC5035 camera.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called gc5035.
+
 config VIDEO_IMX258
 	tristate "Sony IMX258 sensor support"
 	select V4L2_CCI_I2C

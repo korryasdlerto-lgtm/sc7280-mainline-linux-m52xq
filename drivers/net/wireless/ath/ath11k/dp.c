@@ -475,7 +475,9 @@ static int ath11k_dp_srng_common_setup(struct ath11k_base *ab)
 	/* When hash based routing of rx packet is enabled, 32 entries to map
 	 * the hash values to the ring will be configured.
 	 */
+	ath11k_dbg(ab, ATH11K_DBG_HAL, "reo setup begin\n");
 	ab->hw_params.hw_ops->reo_setup(ab);
+	ath11k_dbg(ab, ATH11K_DBG_HAL, "reo setup done\n");
 
 	return 0;
 
@@ -1098,8 +1100,10 @@ int ath11k_dp_alloc(struct ath11k_base *ab)
 		}
 	}
 
+	ath11k_dbg(ab, ATH11K_DBG_HAL, "dscp map setup begin\n");
 	for (i = 0; i < HAL_DSCP_TID_MAP_TBL_NUM_ENTRIES_MAX; i++)
 		ath11k_hal_tx_set_dscp_tid_map(ab, i);
+	ath11k_dbg(ab, ATH11K_DBG_HAL, "dscp map setup done\n");
 
 	/* Init any SOC level resource for DP */
 

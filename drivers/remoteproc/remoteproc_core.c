@@ -1992,6 +1992,28 @@ int rproc_shutdown(struct rproc *rproc)
 		return ret;
 	}
 
+	/*
+	 * m52xq: a crashed processor whose recovery is disabled (RPROC_CRASHED) or whose recovery could not boot it
+	 * again (RPROC_OFFLINE while still powered) used to be stuck: this function refused it, the power count never
+	 * dropped and every later rproc_boot() was skipped, so WPSS (Wi-Fi) came back only after a reboot (2026-10-24).
+	 * Release it like a normal shutdown; a crashed one is stopped first, as the recovery would do.
+	 */
+	if ((rproc->state == RPROC_CRASHED || rproc->state == RPROC_OFFLINE) &&
+	    atomic_read(&rproc->power)) {
+		if (!atomic_dec_and_test(&rproc->power))
+			goto out;
+
+		if (rproc->state == RPROC_CRASHED) {
+			ret = rproc_stop(rproc, true);
+			if (ret) {
+				atomic_inc(&rproc->power);
+				goto out;
+			}
+		}
+		dev_info(dev, "m52xq: released %s after a crash/failed recovery\n", rproc->name);
+		goto release;
+	}
+
 	if (rproc->state != RPROC_RUNNING &&
 	    rproc->state != RPROC_ATTACHED) {
 		ret = -EINVAL;
@@ -2008,6 +2030,7 @@ int rproc_shutdown(struct rproc *rproc)
 		goto out;
 	}
 
+release:
 	/* clean up all acquired resources */
 	rproc_resource_cleanup(rproc);
 

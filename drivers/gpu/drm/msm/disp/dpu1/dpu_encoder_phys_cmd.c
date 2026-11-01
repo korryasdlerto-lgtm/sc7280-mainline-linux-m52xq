@@ -106,6 +106,8 @@ static void dpu_encoder_phys_cmd_pp_tx_done_irq(void *arg)
 					  phys_enc->hw_pp->idx - PINGPONG_0,
 					  new_cnt, event);
 
+	msm_dsi_cmd_frame_end();
+
 	/* Signal any waiting atomic commit thread */
 	wake_up_all(&phys_enc->pending_kickoff_wq);
 	DPU_ATRACE_END("pp_done_irq");
@@ -205,6 +207,7 @@ static int _dpu_encoder_phys_cmd_handle_ppdone_timeout(
 	}
 
 	atomic_add_unless(&phys_enc->pending_kickoff_cnt, -1, 0);
+	msm_dsi_cmd_frame_reset();
 
 	/* request a ctl reset before the next kickoff */
 	phys_enc->enable_state = DPU_ENC_ERR_NEEDS_HW_RESET;
@@ -545,6 +548,8 @@ static void dpu_encoder_phys_cmd_disable(struct dpu_encoder_phys *phys_enc)
 		return;
 	}
 
+	msm_dsi_cmd_frame_reset();
+
 	if (phys_enc->has_intf_te) {
 		DRM_DEBUG_KMS("id:%u intf:%d state:%d\n", DRMID(phys_enc->parent),
 			      phys_enc->hw_intf->idx - INTF_0,
@@ -601,12 +606,19 @@ static void dpu_encoder_phys_cmd_prepare_for_kickoff(
 	if (ret) {
 		/* force pending_kickoff_cnt 0 to discard failed kickoff */
 		atomic_set(&phys_enc->pending_kickoff_cnt, 0);
+		msm_dsi_cmd_frame_reset();
 		DRM_ERROR("failed wait_for_idle: id:%u ret:%d pp:%d\n",
 			  DRMID(phys_enc->parent), ret,
 			  phys_enc->hw_pp->idx - PINGPONG_0);
 	}
 
 	dpu_encoder_phys_cmd_enable_te(phys_enc);
+
+	/*
+	 * M52XQ: frame busy until pp_done, see dsi_host_transfer(). Done here,
+	 * not in trigger_start(), which runs under the encoder spinlock.
+	 */
+	msm_dsi_cmd_frame_begin();
 
 	DPU_DEBUG_CMDENC(cmd_enc, "pp:%d pending_cnt %d\n",
 			phys_enc->hw_pp->idx - PINGPONG_0,
@@ -687,10 +699,24 @@ static int dpu_encoder_phys_cmd_wait_for_commit_done(
 	if (!dpu_encoder_phys_cmd_is_master(phys_enc))
 		return 0;
 
-	if (phys_enc->irq[INTR_IDX_CTL_START] &&
-	    !phys_enc->hw_ctl->ops.is_started(phys_enc->hw_ctl))
-		return _dpu_encoder_phys_cmd_wait_for_ctl_start(phys_enc);
-
+	/*
+	 * M52XQ: the catalog (borrowed from sc7280, since SM7325/yupik has
+	 * no native mainline catalog) claims CTL_0 has a CTL_START IRQ
+	 * (TOP0_INTR2 bit 9), and it looks genuinely wired up -- the
+	 * trigger register write is consumed by hardware (self-clears) and
+	 * the interrupt is correctly unmasked at the EN register (verified
+	 * live: EN0_2 matches the software's own cache_irq_mask exactly).
+	 * Despite that, TOP0_INTR2 never latches ANY bit across dozens of
+	 * live attempts, so the IRQ this SoC's real silicon actually fires
+	 * for CTL start (if any) isn't the one sc7280's catalog describes.
+	 * Skip the CTL_START wait unconditionally and always wait for the
+	 * frame's actual transfer-complete (PING_PONG done) IRQ instead,
+	 * mirroring the fallback path upstream already uses for DPU < 4.x
+	 * hardware that lacks CTL_START entirely (see dpu_encoder_phys_cmd.c
+	 * history) -- here forced rather than catalog-driven, since our
+	 * catalog's belief that CTL_START exists doesn't match what the
+	 * real hardware does.
+	 */
 	return dpu_encoder_phys_cmd_wait_for_tx_complete(phys_enc);
 }
 

@@ -1432,6 +1432,7 @@ static const struct geni_se_desc i2c_master_hub_desc = {
 
 static const struct of_device_id geni_se_dt_match[] = {
 	{ .compatible = "qcom,geni-se-qup", .data = &qup_desc },
+	{ .compatible = "qcom,qupv3-geni-se", .data = &qup_desc }, /* M52XQ extracted downstream DTB */
 	{ .compatible = "qcom,geni-se-i2c-master-hub", .data = &i2c_master_hub_desc },
 	{ .compatible = "qcom,sa8255p-geni-se-qup", .data = &sa8255p_qup_desc },
 	{}

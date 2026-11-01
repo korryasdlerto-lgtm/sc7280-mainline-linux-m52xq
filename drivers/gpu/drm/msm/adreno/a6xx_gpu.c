@@ -9,9 +9,27 @@
 #include "a6xx_gmu.xml.h"
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/devfreq.h>
 #include <linux/pm_domain.h>
 #include <linux/soc/qcom/llcc-qcom.h>
+
+/* M52XQ: 1 = hold OOB_GPU_SET around the WPTR write in a6xx_submit (GX wake) */
+static bool m52xq_wake_before_wptr = true;
+module_param(m52xq_wake_before_wptr, bool, 0444);
+
+/* M52XQ: 1 = skip CP_REG_TO_MEM stats packets in a6xx_submit */
+static bool m52xq_no_stats = false;
+module_param(m52xq_no_stats, bool, 0444);
+
+/* M52XQ: 1 = disable HW clock gating (HWCG) in hw_init */
+static bool m52xq_no_hwcg = false;
+module_param(m52xq_no_hwcg, bool, 0444);
+
+/* M52XQ: 1 = never clear OOB_GPU_SET after hw_init, GMU keeps GX on */
+static bool m52xq_keep_gx = false;
+module_param(m52xq_keep_gx, bool, 0444);
+
 
 #define GPU_PAS_ID 13
 
@@ -338,6 +356,7 @@ static void a6xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 
 	a6xx_set_pagetable(a6xx_gpu, ring, submit);
 
+	if (!m52xq_no_stats) {
 	get_stats_counter(ring, REG_A6XX_RBBM_PERFCTR_CP(0),
 		rbmemptr_stats(ring, index, cpcycles_start));
 
@@ -348,6 +367,7 @@ static void a6xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	 */
 	get_stats_counter(ring, REG_A6XX_CP_ALWAYS_ON_CONTEXT,
 		rbmemptr_stats(ring, index, alwayson_start));
+	}
 
 	/* Invalidate CCU depth and color */
 	OUT_PKT7(ring, CP_EVENT_WRITE, 1);
@@ -385,10 +405,12 @@ static void a6xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 			update_shadow_rptr(gpu, ring);
 	}
 
+	if (!m52xq_no_stats) {
 	get_stats_counter(ring, REG_A6XX_RBBM_PERFCTR_CP(0),
 		rbmemptr_stats(ring, index, cpcycles_end));
 	get_stats_counter(ring, REG_A6XX_CP_ALWAYS_ON_CONTEXT,
 		rbmemptr_stats(ring, index, alwayson_end));
+	}
 
 	/* Write the fence to the scratch register */
 	OUT_PKT4(ring, REG_A6XX_CP_SCRATCH(2), 1);
@@ -406,6 +428,30 @@ static void a6xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	OUT_RING(ring, submit->seqno);
 
 	trace_msm_gpu_submit_flush(submit, adreno_gpu->funcs->get_timestamp(gpu));
+
+	/*
+	 * M52XQ: WPTR writes are dropped while GX is clock-gated (no IFPC/AHB fence
+	 * configured) -> wake GX via OOB_GPU_SET around the WPTR write, like KGSL.
+	 * This sleeps (mutex, usleep in set_oob), so it must not run with IRQs off:
+	 * msm_gpu recover_worker replays submits under spin_lock_irqsave(). The GPU was
+	 * just re-initialised there, so a plain WPTR flush is correct in that case.
+	 */
+	if (m52xq_wake_before_wptr && !adreno_has_gmu_wrapper(adreno_gpu) && !irqs_disabled()) {
+		int oret;
+
+		mutex_lock(&a6xx_gpu->gmu.lock);
+		oret = a6xx_gmu_set_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
+		if (!oret) {
+			a6xx_flush(gpu, ring);
+			a6xx_gmu_clear_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
+		} else {
+			/* GX did not come up: do not kick the CP, let hangcheck recover */
+			dev_err_ratelimited(&gpu->pdev->dev,
+				"M52XQ: OOB GPU_SET failed (%d), WPTR not flushed\n", oret);
+		}
+		mutex_unlock(&a6xx_gpu->gmu.lock);
+		return;
+	}
 
 	a6xx_flush(gpu, ring);
 }
@@ -999,6 +1045,126 @@ static int a6xx_cp_init(struct msm_gpu *gpu)
 	return a6xx_idle(gpu, ring) ? 0 : -EINVAL;
 }
 
+
+/* M52XQ: gpucc access for GX clock CBCR memory retention (sc7280 gpucc @0x3d90000) */
+static bool m52xq_gx_mem_retain = true;
+module_param(m52xq_gx_mem_retain, bool, 0444);
+static void __iomem *m52xq_gpucc;
+
+static void __iomem *m52xq_gpucc_base(void)
+{
+	if (!m52xq_gpucc)
+		m52xq_gpucc = ioremap(0x3d90000, 0x2000);
+	return m52xq_gpucc;
+}
+
+static void m52xq_gx_retain(void)
+{
+	void __iomem *b = m52xq_gpucc_base();
+	u32 v;
+
+	if (!b || !m52xq_gx_mem_retain)
+		return;
+	v = readl(b + 0x1054);
+	if (v && v != 0xffffffff) {
+		writel(v | BIT(14) | BIT(13), b + 0x1054);
+	} else {
+	}
+}
+
+
+/* M52XQ: KGSL-style power-up restore list for a6xx (CP_INIT_REGISTER_INIT_LIST_WITH_SPINLOCK) */
+static bool m52xq_a6xx_reglist = true;
+module_param(m52xq_a6xx_reglist, bool, 0444);
+
+static const u32 m52xq_a6xx_ifpc_regs[] = {
+	REG_A6XX_RBBM_GBIF_CLIENT_QOS_CNTL,
+	REG_A6XX_CP_CHICKEN_DBG,
+	REG_A6XX_CP_DBG_ECO_CNTL,
+	REG_A6XX_CP_PROTECT_CNTL,
+	REG_A6XX_CP_AHB_CNTL,
+	REG_A6XX_CP_APRIV_CNTL,
+};
+
+static const u32 m52xq_a6xx_pwrup_regs[] = {
+	REG_A6XX_VSC_ADDR_MODE_CNTL,
+	REG_A6XX_GRAS_ADDR_MODE_CNTL,
+	REG_A6XX_RB_ADDR_MODE_CNTL,
+	REG_A6XX_PC_ADDR_MODE_CNTL,
+	REG_A6XX_HLSQ_ADDR_MODE_CNTL,
+	REG_A6XX_VFD_ADDR_MODE_CNTL,
+	REG_A6XX_VPC_ADDR_MODE_CNTL,
+	REG_A6XX_UCHE_ADDR_MODE_CNTL,
+	REG_A6XX_SP_ADDR_MODE_CNTL,
+	REG_A6XX_TPL1_ADDR_MODE_CNTL,
+	REG_A6XX_UCHE_WRITE_RANGE_MAX, REG_A6XX_UCHE_WRITE_RANGE_MAX + 1,
+	REG_A6XX_UCHE_TRAP_BASE, REG_A6XX_UCHE_TRAP_BASE + 1,
+	REG_A6XX_UCHE_WRITE_THRU_BASE, REG_A6XX_UCHE_WRITE_THRU_BASE + 1,
+	REG_A6XX_UCHE_GMEM_RANGE_MIN, REG_A6XX_UCHE_GMEM_RANGE_MIN + 1,
+	REG_A6XX_UCHE_GMEM_RANGE_MAX, REG_A6XX_UCHE_GMEM_RANGE_MAX + 1,
+	REG_A6XX_UCHE_FILTER_CNTL,
+	REG_A6XX_UCHE_CACHE_WAYS,
+	REG_A6XX_UCHE_MODE_CNTL,
+	REG_A6XX_RB_NC_MODE_CNTL,
+	REG_A6XX_TPL1_NC_MODE_CNTL,
+	REG_A6XX_SP_NC_MODE_CNTL,
+	REG_A6XX_PC_DBG_ECO_CNTL,
+	REG_A6XX_RB_CONTEXT_SWITCH_GMEM_SAVE_RESTORE_ENABLE,
+};
+
+static void m52xq_a6xx_patch_pwrup_reglist(struct msm_gpu *gpu)
+{
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+	const struct adreno_protect *protect = adreno_gpu->info->a6xx->protect;
+	struct cpu_gpu_lock *lock = a6xx_gpu->pwrup_reglist_ptr;
+	u32 *dest = (u32 *)&lock->regs[0];
+	u32 nifpc = 0, npwr = 0;
+	int i;
+
+	lock->gpu_req = lock->cpu_req = lock->turn = 0;
+
+	for (i = 0; i < ARRAY_SIZE(m52xq_a6xx_ifpc_regs); i++, nifpc++) {
+		*dest++ = m52xq_a6xx_ifpc_regs[i];
+		*dest++ = gpu_read(gpu, m52xq_a6xx_ifpc_regs[i]);
+	}
+	for (i = 0; protect && i < protect->count_max; i++, nifpc++) {
+		*dest++ = REG_A6XX_CP_PROTECT(i);
+		*dest++ = gpu_read(gpu, REG_A6XX_CP_PROTECT(i));
+	}
+	for (i = 0; i < ARRAY_SIZE(m52xq_a6xx_pwrup_regs); i++, npwr++) {
+		*dest++ = m52xq_a6xx_pwrup_regs[i];
+		*dest++ = gpu_read(gpu, m52xq_a6xx_pwrup_regs[i]);
+	}
+
+	lock->list_length = (nifpc + npwr) * 2;
+	lock->list_offset = nifpc * 2;
+	wmb();
+
+}
+
+static int m52xq_a6xx_cp_init_reglist(struct msm_gpu *gpu)
+{
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
+	struct msm_ringbuffer *ring = gpu->rb[0];
+
+	OUT_PKT7(ring, CP_ME_INIT, 9);
+	/* mainline 0x2f + BIT(8) REGISTER_INIT_LIST_WITH_SPINLOCK (KGSL) */
+	OUT_RING(ring, 0x0000012f);
+	OUT_RING(ring, 0x00000003);	/* max contexts */
+	OUT_RING(ring, 0x20000000);	/* error detection */
+	OUT_RING(ring, 0x00000000);	/* header dump addr */
+	OUT_RING(ring, 0x00000000);	/* header dump enable/size */
+	OUT_RING(ring, 0x00000000);	/* ucode workarounds */
+	OUT_RING(ring, lower_32_bits(a6xx_gpu->pwrup_reglist_iova));
+	OUT_RING(ring, upper_32_bits(a6xx_gpu->pwrup_reglist_iova));
+	OUT_RING(ring, 0x00000000);
+
+	a6xx_flush(gpu, ring);
+	return a6xx_idle(gpu, ring) ? 0 : -EINVAL;
+}
+
 static int a7xx_cp_init(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
@@ -1309,7 +1475,8 @@ static int hw_init(struct msm_gpu *gpu)
 	}
 
 	/* enable hardware clockgating */
-	a6xx_set_hwcg(gpu, true);
+	/* M52XQ: optionally keep HW clock gating off so GX is never gated */
+	a6xx_set_hwcg(gpu, !m52xq_no_hwcg);
 
 	/* For gmuwrapper implementations, do the VBIF/GBIF CX configuration here */
 	if (adreno_is_a610_family(adreno_gpu)) {
@@ -1555,6 +1722,10 @@ static int hw_init(struct msm_gpu *gpu)
 		a6xx_gpu->pwrup_reglist_emitted = true;
 	}
 
+	if (!adreno_is_a7xx(adreno_gpu) && m52xq_a6xx_reglist && a6xx_gpu->pwrup_reglist_ptr) {
+		m52xq_a6xx_patch_pwrup_reglist(gpu);
+		ret = m52xq_a6xx_cp_init_reglist(gpu);
+	} else
 	ret = adreno_is_a7xx(adreno_gpu) ? a7xx_cp_init(gpu) : a6xx_cp_init(gpu);
 	if (ret)
 		goto out;
@@ -1572,8 +1743,9 @@ static int hw_init(struct msm_gpu *gpu)
 		OUT_RING(gpu->rb[0], 0x00000000);
 
 		a6xx_flush(gpu, gpu->rb[0]);
-		if (!a6xx_idle(gpu, gpu->rb[0]))
+		if (!a6xx_idle(gpu, gpu->rb[0])) {
 			return -EINVAL;
+		}
 	} else if (ret == -ENODEV) {
 		/*
 		 * This device does not use zap shader (but print a warning
@@ -1600,7 +1772,9 @@ out:
 	 * Tell the GMU that we are done touching the GPU and it can start power
 	 * management
 	 */
-	a6xx_gmu_clear_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
+	m52xq_gx_retain();
+	if (!m52xq_keep_gx)
+		a6xx_gmu_clear_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
 
 	if (a6xx_gpu->gmu.legacy) {
 		/* Take the GMU out of its special boot mode */
@@ -1885,6 +2059,7 @@ static void a6xx_cp_hw_err_irq(struct msm_gpu *gpu)
 
 	if (status & A6XX_CP_INT_CP_ILLEGAL_INSTR_ERROR)
 		dev_err_ratelimited(&gpu->pdev->dev, "CP illegal instruction error\n");
+
 
 }
 
@@ -2461,10 +2636,17 @@ a6xx_create_vm(struct msm_gpu *gpu, struct platform_device *pdev)
 	return adreno_iommu_create_vm(gpu, pdev, quirks);
 }
 
+/* M52XQ: 1 = no per-process pagetables (no CP_SMMU_TABLE_UPDATE), use global VM */
+static bool m52xq_no_ppgt = false;
+module_param(m52xq_no_ppgt, bool, 0444);
+
 static struct drm_gpuvm *
 a6xx_create_private_vm(struct msm_gpu *gpu, bool kernel_managed)
 {
 	struct msm_mmu *mmu;
+
+	if (m52xq_no_ppgt)
+		return ERR_PTR(-ENODEV);
 
 	mmu = msm_iommu_pagetable_create(to_msm_vm(gpu->vm)->mmu, kernel_managed);
 

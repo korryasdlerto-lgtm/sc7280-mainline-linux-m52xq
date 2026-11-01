@@ -7,6 +7,7 @@
  */
 
 #include "adreno_gpu.h"
+#include "a6xx_gpu.h"
 
 bool hang_debug = false;
 MODULE_PARM_DESC(hang_debug, "Dump registers when hang is detected (can be slow!)");
@@ -216,18 +217,21 @@ static int adreno_bind(struct device *dev, struct device *master, void *data)
 	struct msm_gpu *gpu;
 	int ret;
 
+
 	ret = find_chipid(dev->of_node, &config.chip_id);
 	/* We shouldn't have gotten this far if we can't parse the chip_id */
-	if (WARN_ON(ret))
+	if (WARN_ON(ret)) {
 		return ret;
+	}
 
 	dev->platform_data = &config;
 	priv->gpu_pdev = to_platform_device(dev);
 
 	info = adreno_info(config.chip_id);
 	/* We shouldn't have gotten this far if we don't recognize the GPU: */
-	if (WARN_ON(!info))
+	if (WARN_ON(!info)) {
 		return -ENXIO;
+	}
 
 	config.info = info;
 
@@ -271,11 +275,16 @@ static const struct component_ops a3xx_ops = {
 
 static int adreno_probe(struct platform_device *pdev)
 {
-	if (of_device_is_compatible(pdev->dev.of_node, "amd,imageon") ||
-	    msm_gpu_no_components())
-		return msm_gpu_probe(pdev, &a3xx_ops);
+	int m52xq_ret;
 
-	return component_add(&pdev->dev, &a3xx_ops);
+
+	if (of_device_is_compatible(pdev->dev.of_node, "amd,imageon") ||
+	    msm_gpu_no_components()) {
+		return msm_gpu_probe(pdev, &a3xx_ops);
+	}
+
+	m52xq_ret = component_add(&pdev->dev, &a3xx_ops);
+	return m52xq_ret;
 }
 
 static void adreno_remove(struct platform_device *pdev)
@@ -396,8 +405,69 @@ static int adreno_system_resume(struct device *dev)
 	return pm_runtime_force_resume(dev);
 }
 
+/*
+ * M52XQ: after a runtime/system power collapse the GMU cannot bring GX back up (OOB GPU_SET
+ * times out, see README). Variant A: on SYSTEM sleep keep the GPU/GMU powered (only park the
+ * scheduler and wait for the hardware to go idle) instead of pm_runtime_force_suspend().
+ * Shutdown/unbind still use adreno_system_suspend() and do a full suspend.
+ */
+static bool m52xq_gpu_keep_on_suspend;  /* default off: with GMU kept alive the SoC resets in suspend (see README) */
+module_param(m52xq_gpu_keep_on_suspend, bool, 0644);
+
+static int adreno_pm_system_suspend(struct device *dev)
+{
+	struct msm_gpu *gpu = dev_to_gpu(dev);
+	int remaining;
+
+	if (!m52xq_gpu_keep_on_suspend || !gpu)
+		return adreno_system_suspend(dev);
+
+	suspend_scheduler(gpu);
+
+	remaining = wait_event_timeout(gpu->retire_event,
+				       gpu->active_submits == 0,
+				       msecs_to_jiffies(1000));
+	if (remaining == 0) {
+		dev_err(dev, "Timeout waiting for GPU to go idle before sleep\n");
+		resume_scheduler(gpu);
+		return -EBUSY;
+	}
+
+	{
+		struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+
+		if (adreno_gpu->info->family >= ADRENO_6XX_GEN1 &&
+		    adreno_gpu->info->family <= ADRENO_6XX_GEN4 &&
+		    !adreno_has_gmu_wrapper(adreno_gpu))
+			a6xx_gmu_m52xq_syscore(to_a6xx_gpu(adreno_gpu), true);
+	}
+
+	dev_info(dev, "M52XQ: system sleep with GPU kept powered (no GMU power collapse)\n");
+	return 0;
+}
+
+static int adreno_pm_system_resume(struct device *dev)
+{
+	struct msm_gpu *gpu = dev_to_gpu(dev);
+
+	if (!m52xq_gpu_keep_on_suspend || !gpu)
+		return adreno_system_resume(dev);
+
+	{
+		struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+
+		if (adreno_gpu->info->family >= ADRENO_6XX_GEN1 &&
+		    adreno_gpu->info->family <= ADRENO_6XX_GEN4 &&
+		    !adreno_has_gmu_wrapper(adreno_gpu))
+			a6xx_gmu_m52xq_syscore(to_a6xx_gpu(adreno_gpu), false);
+	}
+
+	resume_scheduler(gpu);
+	return 0;
+}
+
 static const struct dev_pm_ops adreno_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(adreno_system_suspend, adreno_system_resume)
+	SYSTEM_SLEEP_PM_OPS(adreno_pm_system_suspend, adreno_pm_system_resume)
 	RUNTIME_PM_OPS(adreno_runtime_suspend, adreno_runtime_resume, NULL)
 };
 

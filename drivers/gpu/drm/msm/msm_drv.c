@@ -135,7 +135,7 @@ static int msm_drm_init(struct device *dev, const struct drm_driver *drv,
 
 	/* Initialize stall-on-fault */
 	spin_lock_init(&priv->fault_stall_lock);
-	priv->stall_enabled = true;
+	priv->stall_enabled = false; /* M52XQ: terminate mode, avoid SMMU fault IRQ storm */
 
 	/* Teach lockdep about lock ordering wrt. shrinker: */
 	fs_reclaim_acquire(GFP_KERNEL);

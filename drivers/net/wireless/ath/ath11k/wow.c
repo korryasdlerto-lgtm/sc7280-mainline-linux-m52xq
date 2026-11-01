@@ -4,6 +4,7 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/hex.h>
 #include <linux/delay.h>
 
 #include "mac.h"
@@ -15,6 +16,133 @@
 #include "wmi.h"
 #include "wow.h"
 #include "dp_rx.h"
+
+/* M52XQ v227: run-time knobs (/sys/module/ath11k/parameters), defaults = the stock Samsung WCN6750 setup */
+static int m52xq_hw_filter = WMI_HW_DATA_FILTER_DROP_NON_ARP_BC; /* gHwFilterMode=1; 0 = no filter, 3 = upstream */
+module_param(m52xq_hw_filter, int, 0644);
+MODULE_PARM_DESC(m52xq_hw_filter, "M52XQ: hw data filter bitmap during WoW (1 stock, 3 upstream, 0 off)");
+static unsigned int m52xq_wow_keepalive = 15; /* gStaKeepAlivePeriod=15 */
+module_param(m52xq_wow_keepalive, uint, 0644);
+MODULE_PARM_DESC(m52xq_wow_keepalive, "M52XQ: keepalive interval in s during WoW");
+static unsigned int m52xq_wow_inactivity = 50; /* g_wow_data_inactivity_timeout default; 0 = not sent */
+module_param(m52xq_wow_inactivity, uint, 0644);
+MODULE_PARM_DESC(m52xq_wow_inactivity, "M52XQ: STA PS inactivity time in ms during WoW (0 = unchanged)");
+
+/*
+ * M52XQ v228: the stock driver (qcacld, LineageOS log) is woken by the firmware with WOW reason BPF_ALLOW: Android loads
+ * an APF program and the firmware wakes the host for every packet the program passes; without a program the WCN6750
+ * firmware drops the packets during WoW (patterns and RA match never woke us). 0 = no program, 1 = pass everything,
+ * 2 = pass frames to our own (unicast) address only: LDB R0,[0]; JSET R0 & 1 -> DROP; PASS.
+ * 3 (v243, default) = unicast IPv4 TCP and ICMP only. Mode 2 passed every unicast frame, so the IPv6 neighbour probes of the
+ * router, the replies to NTP / DHCP / DNS / mDNS requests the phone sent just before sleeping, ARP etc. woke the system
+ * again 1-2 s after it fell asleep (a wake-up storm: 109 wake-ups in 42 min, 5 % asleep, ~360 mA, 30.10.2026).
+ */
+static int m52xq_wow_apf = 2;
+module_param(m52xq_wow_apf, int, 0644);
+MODULE_PARM_DESC(m52xq_wow_apf, "M52XQ: APF program during WoW (0 off, 1 pass all, 2 pass unicast, 3 unicast IPv4 TCP/ICMP (Ethernet frame), 9 bytes from m52xq_wow_apf_hex; v246: 4 pass unicast and 5 bytes from m52xq_wow_apf_hex through the stock path (APF enable + work memory))");
+
+static int m52xq_wow_apf_ver = 4;
+module_param(m52xq_wow_apf_ver, int, 0644);
+MODULE_PARM_DESC(m52xq_wow_apf_ver, "M52XQ: bpf_version for the APF work memory write (modes 4 and 5)");
+
+/*
+ * v244: mode 3 above made the phone deaf to the network during sleep (ping and ssh never woke it), so the frame the firmware
+ * hands to the APF program is probably not the Ethernet frame assumed (mode 2 only looked at byte 0). Mode 9 loads the program
+ * from this string (hex, spaces and ':' ignored), set at run time: echo 9 > m52xq_wow_apf; echo "08 9a 01 01" > m52xq_wow_apf_hex
+ * (takes effect at the next suspend), so the frame layout can be probed without rebuilding the kernel.
+ */
+static char *m52xq_wow_apf_hex = "";
+module_param(m52xq_wow_apf_hex, charp, 0644);
+MODULE_PARM_DESC(m52xq_wow_apf_hex, "M52XQ: APF program bytes in hex for m52xq_wow_apf=9");
+
+static int m52xq_wow_apf_parse(const char *str, u8 *out, int max)
+{
+	int n = 0, nib = -1, c;
+
+	if (!str)
+		return 0;
+	for (; *str; str++) {
+		c = hex_to_bin(*str);
+		if (c < 0)
+			continue;	/* spaces, ':' ... */
+		if (nib < 0) {
+			nib = c;
+		} else {
+			if (n >= max)
+				return -E2BIG;
+			out[n++] = (nib << 4) | c;
+			nib = -1;
+		}
+	}
+	return nib < 0 ? n : -EINVAL;
+}
+
+static void ath11k_wow_apf(struct ath11k *ar, bool enable)
+{
+	static const u8 pass_all[] = { 0x68 };			/* LI R0, 0 -> end of program = PASS */
+	static const u8 pass_ucast[] = { 0x08, 0x9a, 0x01, 0x01 };	/* LDB R0,[0]; JSET R0,1 -> +1 (DROP) */
+	/*
+	 * Ethernet frame; the jump target one past the end of the program (24 + 1) is DROP, the end (24) is PASS:
+	 *  0: LDB R0,[0]            08
+	 *  1: JSET R0,#1 -> DROP    9a 15 01   (not unicast)
+	 *  4: LDB R0,[12]           0a 0c      EtherType high byte
+	 *  6: JNE R0,#0x08 -> DROP  82 10 08
+	 *  9: LDB R0,[13]           0a 0d      EtherType low byte
+	 * 11: JNE R0,#0x00 -> DROP  82 0b 00   (not IPv4)
+	 * 14: LDB R0,[23]           0a 17      IPv4 protocol
+	 * 16: JEQ R0,#6 -> PASS     7a 05 06   (TCP)
+	 * 19: JEQ R0,#1 -> PASS     7a 02 01   (ICMP)
+	 * 22: JMP -> DROP           72 01
+	 */
+	static const u8 pass_ip_tcp_icmp[] = {
+		0x08, 0x9a, 0x15, 0x01,
+		0x0a, 0x0c, 0x82, 0x10, 0x08,
+		0x0a, 0x0d, 0x82, 0x0b, 0x00,
+		0x0a, 0x17, 0x7a, 0x05, 0x06,
+		0x7a, 0x02, 0x01, 0x72, 0x01,
+	};
+	struct ath11k_vif *arvif;
+	u8 custom[256];
+	int custom_len = 0;
+
+	if (m52xq_wow_apf <= 0)
+		return;
+
+	if (enable && (m52xq_wow_apf == 9 || m52xq_wow_apf == 5)) {
+		custom_len = m52xq_wow_apf_parse(m52xq_wow_apf_hex, custom, sizeof(custom));
+		if (custom_len <= 0) {
+			ath11k_warn(ar->ab, "apf: bad m52xq_wow_apf_hex (%d), no program\n", custom_len);
+			return;
+		}
+	}
+
+	list_for_each_entry(arvif, &ar->arvifs, list) {
+		if (arvif->vdev_type != WMI_VDEV_TYPE_STA || !arvif->is_up)
+			continue;
+		if (m52xq_wow_apf == 4 || m52xq_wow_apf == 5) {
+			/* stock path: APF off, program into the work memory, APF on (resume: APF off) */
+			ath11k_wmi_apf_enable(ar, arvif->vdev_id, false);
+			if (enable) {
+				if (m52xq_wow_apf == 4)
+					ath11k_wmi_apf_write_memory(ar, arvif->vdev_id, m52xq_wow_apf_ver, pass_ucast, sizeof(pass_ucast));
+				else
+					ath11k_wmi_apf_write_memory(ar, arvif->vdev_id, m52xq_wow_apf_ver, custom, custom_len);
+				ath11k_wmi_apf_enable(ar, arvif->vdev_id, true);
+			}
+			continue;
+		}
+		if (!enable)
+			ath11k_wmi_apf_del_instructions(ar, arvif->vdev_id);
+		else if (m52xq_wow_apf == 1)
+			ath11k_wmi_apf_set_instructions(ar, arvif->vdev_id, pass_all, sizeof(pass_all));
+		else if (m52xq_wow_apf == 9)
+			ath11k_wmi_apf_set_instructions(ar, arvif->vdev_id, custom, custom_len);
+		else if (m52xq_wow_apf >= 3)
+			ath11k_wmi_apf_set_instructions(ar, arvif->vdev_id, pass_ip_tcp_icmp, sizeof(pass_ip_tcp_icmp));
+		else
+			ath11k_wmi_apf_set_instructions(ar, arvif->vdev_id, pass_ucast, sizeof(pass_ucast));
+	}
+}
 
 static const struct wiphy_wowlan_support ath11k_wowlan_support = {
 	.flags = WIPHY_WOWLAN_DISCONNECT |
@@ -377,6 +505,16 @@ static int ath11k_vif_wow_set_wakeups(struct ath11k_vif *arvif,
 		if (wowlan->magic_pkt)
 			__set_bit(WOW_MAGIC_PKT_RECVD_EVENT, &wow_mask);
 
+		/*
+		 * M52XQ: the vendor driver (qcacld pmo_set_sta_wow_bitmask) also enables WOW_HTT_EVENT and WOW_RA_MATCH_EVENT
+		 * (wake on a unicast frame addressed to us) for a STA; with only PATTERN_MATCH the WCN6750 firmware never
+		 * woke the host for a ping, while a beacon-loss wake (WOW_BMISS_EVENT) reached the host (IRQ 210).
+		 */
+		if (wowlan->n_patterns) {
+			__set_bit(WOW_HTT_EVENT, &wow_mask);
+			__set_bit(WOW_RA_MATCH_EVENT, &wow_mask);
+		}
+
 		if (wowlan->nd_config) {
 			struct wmi_pno_scan_req *pno;
 			int ret;
@@ -449,6 +587,47 @@ static int ath11k_vif_wow_set_wakeups(struct ath11k_vif *arvif,
 
 		pattern_id++;
 		__set_bit(WOW_PATTERN_MATCH_EVENT, &wow_mask);
+
+		/*
+		 * M52XQ: the vendor driver (qcacld pmo_configure_wow_sta) gives the WCN6750 firmware its patterns in the
+		 * 802.3 layout (unicast pattern = own MAC at offset 0); add the user pattern in that layout as well, next to
+		 * the converted 802.11 one, so whichever layout the firmware matches against is covered.
+		 */
+		if (ar->wmi->wmi_ab->wlan_resource_config.rx_decap_mode == ATH11K_HW_TXRX_NATIVE_WIFI &&
+		    patterns[i].pkt_offset < ETH_HLEN) {
+			u8 raw_mask[WOW_MAX_PATTERN_SIZE] = {};
+			int j;
+
+			for (j = 0; j < patterns[i].pattern_len; j++)
+				if (patterns[i].mask[j / 8] & BIT(j % 8))
+					raw_mask[j] = 0xff;
+
+			ret = ath11k_wmi_wow_add_pattern(ar, arvif->vdev_id, pattern_id,
+							 patterns[i].pattern, raw_mask,
+							 patterns[i].pattern_len,
+							 patterns[i].pkt_offset);
+			if (ret)
+				ath11k_warn(ar->ab, "failed to add 802.3 pattern %i to vdev %i: %d\n",
+					    pattern_id, arvif->vdev_id, ret);
+			else
+				pattern_id++;
+		}
+	}
+
+	/*
+	 * M52XQ v227: qcacld sends the whole event bitmap at once in the 4-word layout of the firmware; for a station
+	 * it also enables BETTER_AP, GTK_ERR, NLO, CLIENT_KICKOUT, EXTSCAN (25), OEM_RESPONSE (30), TDLS_CONN_TRACKER (32)
+	 * and 11D_SCAN (35) (pmo_set_sta_wow_bitmask)
+	 */
+	if (m52xq_wow_evt_array) {
+		u32 bitmaps[4] = { (u32)wow_mask, 0, 0, 0 };
+
+		if (arvif->vdev_type == WMI_VDEV_TYPE_STA) {
+			bitmaps[0] |= BIT(WOW_BETTER_AP_EVENT) | BIT(WOW_GTK_ERR_EVENT) |
+				      BIT(WOW_NLO_DETECTED_EVENT) | BIT(WOW_CLIENT_KICKOUT_EVENT) | BIT(25) | BIT(30);
+			bitmaps[1] |= BIT(32 - 32) | BIT(35 - 32);
+		}
+		return ath11k_wmi_wow_add_wakeup_events(ar, arvif->vdev_id, bitmaps);
 	}
 
 	for (i = 0; i < WOW_EVENT_MAX; i++) {
@@ -538,9 +717,11 @@ static int ath11k_wow_set_hw_filter(struct ath11k *ar)
 
 	lockdep_assert_held(&ar->conf_mutex);
 
+	if (m52xq_hw_filter <= 0) /* v227: no hw data filter during WoW */
+		return 0;
+
 	list_for_each_entry(arvif, &ar->arvifs, list) {
-		bitmap = WMI_HW_DATA_FILTER_DROP_NON_ICMPV6_MC |
-			WMI_HW_DATA_FILTER_DROP_NON_ARP_BC;
+		bitmap = m52xq_hw_filter; /* v227: upstream DROP_NON_ICMPV6_MC | DROP_NON_ARP_BC, stock only the latter */
 		ret = ath11k_wmi_hw_data_filter_cmd(ar, arvif->vdev_id,
 						    bitmap,
 						    true);
@@ -671,10 +852,33 @@ static int ath11k_wow_set_keepalive(struct ath11k *ar,
 	return 0;
 }
 
+/*
+ * M52XQ v245: the firmware sometimes does not acknowledge the WoW enable ("htc suspend not complete" three times,
+ * "failed to start wow: -110", 31.10.2026 01:24). op_suspend then returned 1, mac80211 disconnected the station
+ * (deauth by local choice) and the system slept for minutes with a dead Wi-Fi: no message or call could wake it. Undo
+ * everything that was set for the WoW and let the suspend fail instead (the system stays awake, the next try follows).
+ */
+static void ath11k_wow_abort_suspend(struct ath11k *ar)
+{
+	struct ath11k_vif *arvif;
+
+	ath11k_wow_clear_hw_filter(ar);
+	ath11k_wow_apf(ar, false);
+	if (m52xq_wow_inactivity) {
+		list_for_each_entry(arvif, &ar->arvifs, list)
+			if (arvif->vdev_type == WMI_VDEV_TYPE_STA && arvif->is_up)
+				ath11k_wmi_set_sta_ps_param(ar, arvif->vdev_id, WMI_STA_PS_PARAM_INACTIVITY_TIME, 200);
+	}
+	ath11k_wow_protocol_offload(ar, false);
+	ath11k_wow_set_keepalive(ar, WMI_STA_KEEPALIVE_METHOD_NULL_FRAME, WMI_STA_KEEPALIVE_INTERVAL_DISABLE);
+	ath11k_dp_rx_pktlog_start(ar->ab);
+}
+
 int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
 			  struct cfg80211_wowlan *wowlan)
 {
 	struct ath11k *ar = hw->priv;
+	bool abort_suspend = false;
 	int ret;
 
 	ret = ath11k_mac_wait_tx_complete(ar);
@@ -723,15 +927,28 @@ int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
 
 	ret = ath11k_wow_set_keepalive(ar,
 				       WMI_STA_KEEPALIVE_METHOD_NULL_FRAME,
-				       WMI_STA_KEEPALIVE_INTERVAL_DEFAULT);
+				       m52xq_wow_keepalive ? m52xq_wow_keepalive : WMI_STA_KEEPALIVE_INTERVAL_DEFAULT);
 	if (ret) {
 		ath11k_warn(ar->ab, "failed to enable wow keepalive: %d\n", ret);
 		goto cleanup;
 	}
 
+	ath11k_wow_apf(ar, true); /* v228 */
+
+	/* M52XQ v227: like qcacld pmo_configure_vdev_suspend_params: the STA PS inactivity time for the WoW time */
+	if (m52xq_wow_inactivity) {
+		struct ath11k_vif *arvif;
+
+		list_for_each_entry(arvif, &ar->arvifs, list)
+			if (arvif->vdev_type == WMI_VDEV_TYPE_STA && arvif->is_up)
+				ath11k_wmi_set_sta_ps_param(ar, arvif->vdev_id, WMI_STA_PS_PARAM_INACTIVITY_TIME,
+							    m52xq_wow_inactivity);
+	}
+
 	ret = ath11k_wow_enable(ar->ab);
 	if (ret) {
 		ath11k_warn(ar->ab, "failed to start wow: %d\n", ret);
+		abort_suspend = true;	/* v245 */
 		goto cleanup;
 	}
 
@@ -762,9 +979,13 @@ wakeup:
 
 cleanup:
 	ath11k_wow_cleanup(ar);
+	if (abort_suspend)
+		ath11k_wow_abort_suspend(ar);
 
 exit:
 	mutex_unlock(&ar->conf_mutex);
+	if (abort_suspend)
+		return -EBUSY;	/* mac80211: err < 0 = the suspend is cancelled, the station stays connected */
 	return ret ? 1 : 0;
 }
 
@@ -815,6 +1036,17 @@ int ath11k_wow_op_resume(struct ieee80211_hw *hw)
 	if (ret) {
 		ath11k_warn(ar->ab, "failed to clear hw filter: %d\n", ret);
 		goto exit;
+	}
+
+	ath11k_wow_apf(ar, false); /* v228 */
+
+	/* M52XQ v227: the inactivity time of the awake station again (qcacld ps_data_inactivity_timeout default 200) */
+	if (m52xq_wow_inactivity) {
+		struct ath11k_vif *arvif;
+
+		list_for_each_entry(arvif, &ar->arvifs, list)
+			if (arvif->vdev_type == WMI_VDEV_TYPE_STA && arvif->is_up)
+				ath11k_wmi_set_sta_ps_param(ar, arvif->vdev_id, WMI_STA_PS_PARAM_INACTIVITY_TIME, 200);
 	}
 
 	ret = ath11k_wow_protocol_offload(ar, false);

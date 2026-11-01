@@ -202,12 +202,14 @@ adreno_iommu_create_vm(struct msm_gpu *gpu,
 	u64 start, size;
 
 	mmu = msm_iommu_gpu_new(&pdev->dev, gpu, quirks);
-	if (IS_ERR(mmu))
+	if (IS_ERR(mmu)) {
 		return ERR_CAST(mmu);
+	}
 
 	geometry = msm_iommu_get_geometry(mmu);
-	if (IS_ERR(geometry))
+	if (IS_ERR(geometry)) {
 		return ERR_CAST(geometry);
+	}
 
 	/*
 	 * Use the aperture start or SZ_16M, whichever is greater. This will
@@ -263,7 +265,7 @@ void adreno_check_and_reenable_stall(struct adreno_gpu *adreno_gpu)
 	 * collect a crashdump to re-enable stall-on-fault.
 	 */
 	spin_lock_irqsave(&priv->fault_stall_lock, flags);
-	if (!priv->stall_enabled &&
+	if (false /* M52XQ: never re-enable stall */ && !priv->stall_enabled &&
 			ktime_after(ktime_get(), priv->stall_reenable_time) &&
 			!READ_ONCE(gpu->crashstate)) {
 		struct msm_mmu *mmu = to_msm_vm(gpu->vm)->mmu;
@@ -1126,8 +1128,9 @@ static int adreno_get_pwrlevels(struct device *dev,
 
 	/* Find the fastest defined rate */
 	opp = dev_pm_opp_find_freq_floor(dev, &freq);
-	if (IS_ERR(opp))
+	if (IS_ERR(opp)) {
 		return PTR_ERR(opp);
+	}
 
 	gpu->fast_rate = freq;
 	dev_pm_opp_put(opp);

@@ -1041,7 +1041,10 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 	 * Even though RPMh doesn't directly use cmd-db, all of its children
 	 * do. To avoid adding this check to our children we'll do it now.
 	 */
+	pr_err("CP90-rpmh_rsc_probe-ENTER-name=%s\n", dn->full_name);
+
 	ret = cmd_db_ready();
+	pr_err("CP91-cmd_db_ready-ret=%d\n", ret);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "Command DB not available\n");
@@ -1074,23 +1077,30 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 	else
 		drv->regs = rpmh_rsc_reg_offset_ver_2_7;
 
+	pr_err("CP92-before-rpmh_probe_tcs_config\n");
 	ret = rpmh_probe_tcs_config(pdev, drv);
-	if (ret)
+	if (ret) {
+		pr_err("CP93-rpmh_probe_tcs_config-FAILED-ret=%d\n", ret);
 		return ret;
+	}
 
 	spin_lock_init(&drv->lock);
 	init_waitqueue_head(&drv->tcs_wait);
 	bitmap_zero(drv->tcs_in_use, MAX_TCS_NR);
 
 	irq = platform_get_irq(pdev, drv->id);
-	if (irq < 0)
+	if (irq < 0) {
+		pr_err("CP94-platform_get_irq-FAILED-ret=%d\n", irq);
 		return irq;
+	}
 
 	ret = devm_request_irq(&pdev->dev, irq, tcs_tx_done,
 			       IRQF_TRIGGER_HIGH | IRQF_NO_SUSPEND,
 			       drv->name, drv);
-	if (ret)
+	if (ret) {
+		pr_err("CP94b-request_irq-FAILED-ret=%d\n", ret);
 		return ret;
+	}
 
 	/*
 	 * CPU PM/genpd notification are not required for controllers that support
@@ -1122,11 +1132,15 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 	dev_set_drvdata(&pdev->dev, drv);
 	drv->dev = &pdev->dev;
 
+	pr_err("CP95-rpmh_rsc_probe-reached-of_platform_populate\n");
+
 	ret = devm_of_platform_populate(&pdev->dev);
 	if (ret && pdev->dev.pm_domain) {
 		dev_pm_genpd_remove_notifier(&pdev->dev);
 		pm_runtime_disable(&pdev->dev);
 	}
+
+	pr_err("CP96-rpmh_rsc_probe-EXIT-ret=%d\n", ret);
 
 	return ret;
 }
