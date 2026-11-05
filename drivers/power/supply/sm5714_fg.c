@@ -291,6 +291,9 @@ static void sm5714_fg_cancel_work(void *data)
  * The PMIC ADC node comes from the Samsung DTBO overlay, so io-channels holds
  * a fixed phandle number. Check that it still resolves to the battery NTC
  * channel before using it: a stale phandle must not defer the gauge forever.
+ * v253: the ADC node is "vadc" in the downstream DT and "adc@3100" in the
+ * upstream-style DT; with only "vadc" accepted the gauge used its own die
+ * temperature, which heats up while charging (9 V AFC flapping to 5 V).
  */
 static struct iio_channel *sm5714_fg_get_ntc(struct device *dev)
 {
@@ -301,7 +304,8 @@ static struct iio_channel *sm5714_fg_get_ntc(struct device *dev)
 	if (of_parse_phandle_with_args(dev->of_node, "io-channels",
 				       "#io-channel-cells", 0, &args))
 		return NULL;
-	ok = of_node_name_eq(args.np, "vadc") && args.args_count == 1 &&
+	ok = (of_node_name_eq(args.np, "vadc") || of_node_name_eq(args.np, "adc")) &&
+	     args.args_count == 1 &&
 	     args.args[0] == SM5714_FG_NTC_ADC_CHANNEL;
 	of_node_put(args.np);
 	if (!ok) {

@@ -3329,7 +3329,6 @@ static void ath11k_qmi_driver_event_work(struct work_struct *work)
 				}
 				set_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags);
 			}
-
 			break;
 		case ATH11K_QMI_EVENT_COLD_BOOT_CAL_DONE:
 			break;

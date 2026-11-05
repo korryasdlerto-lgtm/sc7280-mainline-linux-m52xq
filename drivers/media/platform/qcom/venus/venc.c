@@ -659,6 +659,29 @@ static void venc_pm_touch(struct venus_inst *inst)
 	pm_runtime_mark_last_busy(inst->core->dev_enc);
 }
 
+/*
+ * m52xq: the SM7325 encoder firmware asserts (Err_Fatal venus_venc_hal.c:9326)
+ * when the target bitrate is too low for the frame size: 3840x2160@30 fails at
+ * 4 Mbit/s and works at 9 Mbit/s. The control default (1 Mbit/s) is replaced
+ * by 2 Mbit/s per 1280x720@30, any lower value is raised to 1.5 Mbit/s per
+ * 1280x720@30 (2026-11-03).
+ */
+#define M52XQ_VENC_CTRL_BITRATE_DEFAULT	1000000
+
+static u32 m52xq_venc_bitrate(struct venus_inst *inst, u32 bitrate)
+{
+	u64 scale = (u64)inst->width * inst->height * max(inst->fps, 1U);
+	u64 def = div_u64(2000000ULL * scale, 1280 * 720 * 30);
+	u64 min = div_u64(1500000ULL * scale, 1280 * 720 * 30);
+
+	if (bitrate == M52XQ_VENC_CTRL_BITRATE_DEFAULT && def > bitrate)
+		bitrate = min_t(u64, def, 160000000);
+	else if (bitrate < min)
+		bitrate = min_t(u64, min, 160000000);
+
+	return bitrate;
+}
+
 static int venc_set_properties(struct venus_inst *inst)
 {
 	struct venc_controls *ctr = &inst->controls.enc;
@@ -852,6 +875,9 @@ static int venc_set_properties(struct venus_inst *inst)
 		else
 			bitrate = ctr->bitrate;
 
+		if (rate_control != HFI_RATE_CONTROL_OFF)
+			bitrate = m52xq_venc_bitrate(inst, bitrate);
+
 		ptype = HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE;
 		brate.bitrate = bitrate;
 		brate.layer_id = 0;
@@ -860,7 +886,8 @@ static int venc_set_properties(struct venus_inst *inst)
 		if (ret)
 			return ret;
 
-		if (!ctr->bitrate_peak)
+		/* m52xq: also when the peak is below the (raised) target */
+		if (!ctr->bitrate_peak || ctr->bitrate_peak < bitrate)
 			bitrate *= 2;
 		else
 			bitrate = ctr->bitrate_peak;

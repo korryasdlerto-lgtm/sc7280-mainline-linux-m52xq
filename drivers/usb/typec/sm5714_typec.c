@@ -67,6 +67,9 @@ struct sm5714_tc {
 	bool vbus_on;
 	int attach;		/* last CC_STATUS attach type, -1: unknown */
 	int flip;
+	/* v252: the I2C bus is down while the system sleeps, defer the irq to resume */
+	bool suspended;
+	bool irq_deferred;
 };
 
 static const char * const sm5714_tc_attach_name[] = {
@@ -141,6 +144,8 @@ static void sm5714_tc_update(struct sm5714_tc *tc)
 	source = attach == SM5714_TC_ATTACH_SINK;
 	if (source)
 		role = USB_ROLE_HOST;
+	else if (attach == SM5714_TC_ATTACH_NONE)
+		role = USB_ROLE_NONE;	/* v251: let dwc3 see the cable detach */
 
 	/* VBUS off before the controller leaves host mode, on before it enters it */
 	if (!source)
@@ -173,6 +178,13 @@ static irqreturn_t sm5714_tc_irq(int irq, void *data)
 	struct sm5714_tc *tc = data;
 	u8 ints[5];
 	int ret;
+
+	if (READ_ONCE(tc->suspended)) {
+		/* level irq: keep it off until resume, the line stays asserted */
+		disable_irq_nosync(irq);
+		WRITE_ONCE(tc->irq_deferred, true);
+		return IRQ_HANDLED;
+	}
 
 	ret = i2c_smbus_read_i2c_block_data(tc->client, SM5714_TC_REG_INT1,
 					    sizeof(ints), ints);
@@ -249,6 +261,7 @@ static int sm5714_tc_probe(struct i2c_client *client)
 	tc = devm_kzalloc(dev, sizeof(*tc), GFP_KERNEL);
 	if (!tc)
 		return -ENOMEM;
+	i2c_set_clientdata(client, tc);
 	tc->dev = dev;
 	tc->client = client;
 	tc->attach = -1;
@@ -311,6 +324,28 @@ static int sm5714_tc_probe(struct i2c_client *client)
 	return 0;
 }
 
+static int sm5714_tc_suspend(struct device *dev)
+{
+	struct sm5714_tc *tc = dev_get_drvdata(dev);
+
+	WRITE_ONCE(tc->suspended, true);
+	return 0;
+}
+
+static int sm5714_tc_resume(struct device *dev)
+{
+	struct sm5714_tc *tc = dev_get_drvdata(dev);
+
+	WRITE_ONCE(tc->suspended, false);
+	if (READ_ONCE(tc->irq_deferred)) {
+		WRITE_ONCE(tc->irq_deferred, false);
+		enable_irq(tc->client->irq);
+	}
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sm5714_tc_pm_ops, sm5714_tc_suspend, sm5714_tc_resume);
+
 static const struct of_device_id sm5714_tc_of_match[] = {
 	{ .compatible = "siliconmitus,sm5714-usbpd" },
 	{ .compatible = "sm5714-usbpd" },	/* as named by the Samsung DTBO */
@@ -322,6 +357,7 @@ static struct i2c_driver sm5714_tc_driver = {
 	.driver = {
 		.name = "sm5714-usbpd",
 		.of_match_table = sm5714_tc_of_match,
+		.pm = pm_sleep_ptr(&sm5714_tc_pm_ops),
 	},
 	.probe = sm5714_tc_probe,
 };

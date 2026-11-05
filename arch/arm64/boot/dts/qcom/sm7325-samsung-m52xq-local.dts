@@ -1,0 +1,932 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Local (NOT for upstream) additions to sm7325-samsung-m52xq.dts, needed to
+ * boot this DTB on the phone with the m52xq kernel (#437):
+ *  - qcom,msm-id/board-id/dtbo-version: Samsung ABL picks the DTB by them;
+ *  - bootargs of the working system;
+ *  - m52xq,camera-ahb-on: m52xq gcc-sc7280.c hack, camcc hangs the bus without it;
+ *  - Synaptics S3908 touchscreen: no upstream binding/driver yet
+ *    (synaptics_tcm_oncell.c is out of tree), AVDD switched by GPIO 106.
+ * Use together with dtbo-frag (a dtbo with one fragment) in the dtbo partition.
+ */
+
+#include "sm7325-samsung-m52xq.dts"
+
+/ {
+	qcom,msm-id = <0x1db 0x10000>, <0x203 0x10000>;
+	qcom,board-id = <0 0>;
+	dtbo-version = <0>;
+
+	chosen {
+		bootargs = "log_buf_len=256K rcupdate.rcu_expedited=1 rcu_nocbs=0-7 kpti=off cgroup.memory=nokmem fw_devlink=permissive msm.m52xq_no_gpu_opp=0 ufshcd_core.m52xq_ufs_gear=3 transparent_hugepage=never";
+	};
+
+	vreg_tsp_avdd: regulator-tsp-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "tsp_avdd";
+		gpio = <&tlmm 106 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+&gcc {
+	m52xq,camera-ahb-on;
+};
+
+/* zap shader as installed on the phone's rootfs */
+&gpu_zap_shader {
+	firmware-name = "a660_zap.mdt";
+};
+
+/*
+ * With MDSS enabled the display clocks belong to it: BYTE0 is fed by the DSI
+ * PHY PLL, simpledrm enabling it before the PHY is up fails ("DSI PLL(0) lock
+ * failed") and hangs the boot. Same as the working downstream-based DT.
+ */
+&framebuffer0 {
+	/delete-property/ clocks;
+	/delete-property/ power-domains;
+};
+
+/* S6E3HAB AMB667AN01 command-mode panel: m52xq out-of-tree panel driver */
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi {
+	vdda-supply = <&vreg_l6b_1p2>;
+
+	status = "okay";
+
+	panel: panel@0 {
+		compatible = "samsung,s6e3hab-amb667an01";
+		reg = <0>;
+
+		reset-gpios = <&tlmm 44 GPIO_ACTIVE_LOW>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+};
+
+&mdss_dsi_phy {
+	vdds-supply = <&vreg_l10c_0p88>;
+
+	status = "okay";
+};
+
+/*
+ * Speaker: TFA9878 on QUIN MI2S (m52xq tfa9878.c driver), SE1 is shared with
+ * another EE ("qcom,shared", m52xq i2c-qcom-geni.c: GPI only).
+ */
+&gpi_dma0 {
+	status = "okay";
+};
+
+&qupv3_id_0 {
+	/*
+	 * The QUP0 SE DMA stream (SID 0x123) is shared with the ADSP (sensors
+	 * island bus, speaker amp SE1). The m52xq arm-smmu-qcom.c puts the
+	 * downstream "qcom,qupv3-geni-se" wrapper in IDENTITY (bypass), like
+	 * downstream; with a translating domain the ADSP DMA faults
+	 * (SID 0x123, iova 0xffffbxxx) and the ADSP crashes every ~26 s
+	 * ("qup_gpi_island.c:214:bus recovery fatal").
+	 */
+	compatible = "qcom,geni-se-qup", "qcom,qupv3-geni-se";
+
+	status = "okay";
+};
+
+&i2c1 {
+	qcom,shared;
+
+	status = "okay";
+
+	speaker_amp: audio-amp@34 {
+		compatible = "tfa,tfa98xx";
+		reg = <0x34>;
+		#sound-dai-cells = <0>;
+
+		irq-gpio = <&tlmm 55 GPIO_ACTIVE_HIGH>;
+		reset-gpio = <&tlmm 63 GPIO_ACTIVE_HIGH>;
+		port_id = <0x1016>;
+
+		pinctrl-0 = <&tfa9878_default>;
+		pinctrl-names = "default";
+	};
+};
+
+&qup_i2c1_data_clk {
+	drive-strength = <2>;
+	bias-pull-up;
+};
+
+&tlmm {
+	tfa9878_default: tfa9878-default-state {
+		pins = "gpio55", "gpio63";
+		function = "gpio";
+		bias-disable;
+	};
+};
+
+&q6afedai {
+	dai@127 {
+		reg = <QUINARY_MI2S_RX>;
+		qcom,sd-lines = <1>;
+	};
+
+	dai@128 {
+		reg = <QUINARY_MI2S_TX>;
+		qcom,sd-lines = <0>;
+	};
+};
+
+&remoteproc_adsp {
+	firmware-name = "adsp.mdt";
+	/* m52xq qcom_q6v5: hold APPS -> LPASS core cfg while the ADSP runs, else the AFE HW vote fails */
+	interconnects = <&gem_noc MASTER_APPSS_PROC 0 &lpass_ag_noc SLAVE_LPASS_CORE_CFG 0>;
+	qcom,keep-interconnect-vote;
+};
+
+/*
+ * Same as the working downstream-based DT: no qcom,vmids and no memory-region
+ * on the ADSP fastrpc. With the kodiak VMIDs (LPASS, ADSP_HEAP) the ADSP
+ * crashes every ~26 s once the sensors PD attaches
+ * ("qup_gpi_island.c:214:bus recovery fatal").
+ */
+&{/soc@0/remoteproc@3700000/glink-edge/fastrpc} {
+	/delete-property/ qcom,vmids;
+	/delete-property/ memory-region;
+};
+
+/* m52xq q6voice (CS voice through the ADSP, msm8916-mainline style) */
+&{/soc@0/remoteproc@3700000/glink-edge/apr} {
+	service@9 {
+		compatible = "qcom,q6mvm";
+		reg = <9>;
+		qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+
+		q6voicedai: dais {
+			compatible = "qcom,q6voice-dais";
+			#sound-dai-cells = <0>;
+		};
+	};
+
+	service@a {
+		compatible = "qcom,q6cvs";
+		reg = <10>;
+		qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+	};
+
+	service@b {
+		compatible = "qcom,q6cvp";
+		reg = <11>;
+		qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+	};
+};
+
+/*
+ * Headset/microphones: WCD9385 on the RX/TX SoundWire buses. With the ADSP
+ * firmware the macro clocks come from the AFE (q6afecc), lpass_aon/lpass_hm
+ * are owned by the ADSP.
+ */
+&lpass_audiocc {
+	compatible = "qcom,qcm6490-lpassaudiocc";
+	/delete-property/ power-domains;
+};
+
+&lpass_rx_macro {
+	clocks = <&q6afecc LPASS_CLK_ID_TX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_CLK_ID_TX_CORE_NPL_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&lpass_va_macro>;
+	clock-names = "mclk", "npl", "macro", "dcodec", "fsgen";
+	/delete-property/ power-domains;
+	/delete-property/ power-domain-names;
+
+	status = "okay";
+};
+
+&lpass_tx_macro {
+	clocks = <&q6afecc LPASS_CLK_ID_TX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_CLK_ID_TX_CORE_NPL_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&lpass_va_macro>;
+	clock-names = "mclk", "npl", "macro", "dcodec", "fsgen";
+	/delete-property/ power-domains;
+	/delete-property/ power-domain-names;
+
+	status = "okay";
+};
+
+&lpass_va_macro {
+	clocks = <&q6afecc LPASS_CLK_ID_TX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
+		 <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+	clock-names = "mclk", "macro", "dcodec";
+	/delete-property/ power-domains;
+	/delete-property/ power-domain-names;
+
+	status = "okay";
+};
+
+&swr0 {
+	qcom,ports-word-length = /bits/ 8 <0x01 0x07 0x04 0xff 0xff>;
+	qcom,ports-sinterval-low = /bits/ 8 <0x03 0x3f 0x1f 0x03 0x03>;
+	qcom,ports-offset1 = /bits/ 8 <0x00 0x00 0x0b 0x01 0x01>;
+	qcom,ports-offset2 = /bits/ 8 <0x00 0x00 0x0b 0x00 0x00>;
+	qcom,ports-lane-control = /bits/ 8 <0x01 0x00 0x00 0x00 0x00>;
+	qcom,ports-block-pack-mode = /bits/ 8 <0xff 0x00 0x01 0xff 0xff>;
+	qcom,ports-hstart = /bits/ 8 <0xff 0x03 0xff 0xff 0xff>;
+	qcom,ports-hstop = /bits/ 8 <0xff 0x06 0xff 0xff 0xff>;
+	qcom,ports-block-group-count = /bits/ 8 <0xff 0xff 0xff 0xff 0x00>;
+
+	status = "okay";
+
+	wcd_rx: codec@0,4 {
+		compatible = "sdw20217010d00";
+		reg = <0 4>;
+		qcom,rx-port-mapping = <1 2 3 4 5>;
+	};
+};
+
+&swr1 {
+	qcom,ports-sinterval-low = /bits/ 8 <0x01 0x01 0x03>;
+	qcom,ports-offset1 = /bits/ 8 <0x00 0x01 0x02>;
+	qcom,ports-offset2 = /bits/ 8 <0x00 0x00 0x00>;
+	qcom,ports-hstart = /bits/ 8 <0xff 0xff 0xff>;
+	qcom,ports-hstop = /bits/ 8 <0xff 0xff 0xff>;
+	qcom,ports-word-length = /bits/ 8 <0xff 0xff 0xff>;
+	qcom,ports-block-pack-mode = /bits/ 8 <0xff 0xff 0xff>;
+	qcom,ports-block-group-count = /bits/ 8 <0xff 0xff 0xff>;
+	qcom,ports-lane-control = /bits/ 8 <0x01 0x00 0x00>;
+
+	status = "okay";
+
+	wcd_tx: codec@0,3 {
+		compatible = "sdw20217010d00";
+		reg = <0 3>;
+		qcom,tx-port-mapping = <1 2 3 4>;
+	};
+};
+
+/ {
+	wcd9385: audio-codec {
+		compatible = "qcom,wcd9385-codec";
+
+		reset-gpios = <&tlmm 83 GPIO_ACTIVE_LOW>;
+
+		vdd-rxtx-supply = <&vreg_l18b_1p8>;
+		vdd-io-supply = <&vreg_l18b_1p8>;
+		vdd-buck-supply = <&vreg_l17b_1p7>;
+		vdd-mic-bias-supply = <&vreg_bob>;
+
+		qcom,micbias1-microvolt = <1800000>;
+		qcom,micbias2-microvolt = <1800000>;
+		qcom,micbias3-microvolt = <1800000>;
+		qcom,micbias4-microvolt = <1800000>;
+		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000 500000 500000 500000 500000>;
+		qcom,mbhc-headset-vthreshold-microvolt = <1700000>;
+		qcom,mbhc-headphone-vthreshold-microvolt = <50000>;
+		qcom,rx-device = <&wcd_rx>;
+		qcom,tx-device = <&wcd_tx>;
+
+		#sound-dai-cells = <1>;
+	};
+};
+
+&sound {
+	compatible = "qcom,sm8250-sndcard";
+	/* the UCM profile on the rootfs is matched by this name */
+	model = "SM-M526B-WCD938X";
+
+	pinctrl-0 = <&lpass_i2s1_active>;
+	pinctrl-names = "default";
+
+	audio-routing = "IN1_HPHL", "HPHL_OUT",
+			"IN2_HPHR", "HPHR_OUT",
+			"IN3_AUX", "AUX_OUT",
+			"AMIC1", "MIC BIAS1",
+			"AMIC2", "MIC BIAS2",
+			"AMIC3", "MIC BIAS1",
+			"AMIC4", "MIC BIAS3",
+			"TX SWR_ADC0", "ADC1_OUTPUT",
+			"TX SWR_ADC1", "ADC2_OUTPUT",
+			"TX SWR_DMIC0", "ADC3_OUTPUT",
+			"TX SWR_DMIC1", "ADC4_OUTPUT";
+
+	/* same link order as the working DT: the UCM profile uses these PCM numbers */
+	mm1-dai-link {
+		link-name = "MultiMedia1";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+		};
+	};
+
+	mm2-dai-link {
+		link-name = "MultiMedia2";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
+		};
+	};
+
+	wcd-playback-dai-link {
+		link-name = "WCD Playback";
+
+		cpu {
+			sound-dai = <&q6afedai RX_CODEC_DMA_RX_0>;
+		};
+
+		codec {
+			sound-dai = <&wcd9385 0>, <&swr0 0>, <&lpass_rx_macro 0>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	speaker-dai-link {
+		link-name = "Speaker Playback";
+
+		cpu {
+			sound-dai = <&q6afedai QUINARY_MI2S_RX>;
+		};
+
+		codec {
+			sound-dai = <&speaker_amp>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	speaker-feedback-dai-link {
+		link-name = "Speaker Feedback";
+
+		cpu {
+			sound-dai = <&q6afedai QUINARY_MI2S_TX>;
+		};
+
+		codec {
+			sound-dai = <&speaker_amp>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	cs-voice-dai-link {
+		link-name = "CS-Voice";
+
+		cpu {
+			sound-dai = <&q6voicedai>;
+		};
+	};
+
+	wcd-capture-dai-link {
+		link-name = "WCD Capture";
+
+		cpu {
+			sound-dai = <&q6afedai TX_CODEC_DMA_TX_3>;
+		};
+
+		codec {
+			sound-dai = <&wcd9385 1>, <&swr1 0>, <&lpass_tx_macro 0>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	/* AFE pseudo ports (m52xq q6afe): in-call record Tx/Rx, voice playback Tx */
+	voice-record-tx-dai-link {
+		link-name = "Voice Record TX";
+
+		cpu {
+			sound-dai = <&q6afedai 150>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	voice-record-rx-dai-link {
+		link-name = "Voice Record RX";
+
+		cpu {
+			sound-dai = <&q6afedai 149>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	voice-playback-tx-dai-link {
+		link-name = "Voice Playback TX";
+
+		cpu {
+			sound-dai = <&q6afedai 151>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+};
+
+&i2c13 {
+	clock-frequency = <400000>;
+
+	status = "okay";
+
+	touchscreen@4b {
+		compatible = "syna,s3908";
+		reg = <0x4b>;
+		interrupts-extended = <&tlmm 81 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 105 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vreg_l7c_3p0>;
+		vcc-supply = <&vreg_tsp_avdd>;
+	};
+};
+
+&qup_i2c13_data_clk {
+	drive-strength = <2>;
+	bias-pull-up;
+};
+
+
+/*
+ * ADSP smp2p entries of the working DT: "sleepstate" tells the ADSP that the
+ * AP is suspended (m52xq smp2p_sleepstate.c), "sleepstate_see" is the sensors
+ * (SEE) wake line, "rdbg" the remote debug pair.
+ */
+&{/smp2p-adsp} {
+	adsp_rdbg_out: rdbg-out {
+		qcom,entry-name = "rdbg";
+		#qcom,smem-state-cells = <1>;
+	};
+
+	adsp_rdbg_in: rdbg-in {
+		qcom,entry-name = "rdbg";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+
+	adsp_sleepstate_out: sleepstate-out {
+		qcom,entry-name = "sleepstate";
+		#qcom,smem-state-cells = <1>;
+	};
+
+	adsp_sleepstate_in: sleepstate-in {
+		qcom,entry-name = "sleepstate_see";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+};
+
+/ {
+	smp2p-sleepstate {
+		compatible = "qcom,smp2p-sleepstate";
+		qcom,smem-states = <&adsp_sleepstate_out 0>;
+		interrupts-extended = <&adsp_sleepstate_in 0 IRQ_TYPE_NONE>;
+		interrupt-names = "smp2p-sleepstate-in";
+	};
+};
+
+/* firmware as installed on the phone's rootfs (/lib/firmware) */
+&ipa {
+	firmware-name = "yupik_ipa_fws.mdt";
+};
+
+&remoteproc_mpss {
+	firmware-name = "modem.mdt";
+};
+
+&remoteproc_wpss {
+	firmware-name = "wpss.mdt";
+};
+
+/* SM5714 charger + fuel gauge and USB-C PD controller (m52xq drivers) */
+&i2c3 {
+	status = "okay";
+
+	fuel-gauge@71 {
+		compatible = "siliconmitus,sm5714-fuelgauge";
+		reg = <0x71>;
+		io-channels = <&pmk8350_vadc PM7325_ADC7_GPIO2_100K_PU>;
+	};
+
+	charger@49 {
+		compatible = "siliconmitus,sm5714-charger";
+		reg = <0x49>;
+
+		vreg_usb_otg: usb-otg-vbus {
+			regulator-name = "sm5714-otg-vbus";
+			regulator-min-microvolt = <5100000>;
+			regulator-max-microvolt = <5100000>;
+		};
+	};
+};
+
+&qup_i2c3_data_clk {
+	drive-strength = <2>;
+	bias-pull-up;
+};
+
+&i2c8 {
+	status = "okay";
+
+	typec@33 {
+		compatible = "siliconmitus,sm5714-usbpd";
+		reg = <0x33>;
+		interrupts-extended = <&tlmm 140 IRQ_TYPE_LEVEL_LOW>;
+		vbus-supply = <&vreg_usb_otg>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C";
+			power-role = "dual";
+			data-role = "dual";
+			try-power-role = "sink";
+
+			/*
+			 * v26: link the connector to dwc3 so that the driver finds the
+			 * role switch; without it dwc3 never sees the cable detach and
+			 * stays "configured" (USB state stuck after unplugging)
+			 */
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					sm5714_hs_in: endpoint {
+						remote-endpoint = <&usb_1_dwc3_hs>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&usb_1 {
+	dr_mode = "otg";
+	usb-role-switch;
+};
+
+&usb_1_dwc3_hs {
+	remote-endpoint = <&sm5714_hs_in>;
+};
+
+&qup_i2c8_data_clk {
+	drive-strength = <2>;
+	bias-pull-up;
+};
+
+/*
+ * LLCC breaks the GPU on this phone (Adreno 642L): with the GPU/GPUHTW slices
+ * active the GPU faults and hangs within minutes (A/B tested on the working
+ * port, vendor_boot v160 vs v159). Keep it off until that is understood.
+ */
+&{/soc@0/system-cache-controller@9200000} {
+	status = "disabled";
+};
+
+
+
+/*
+ * Cameras (as in the working DT v148): S5KGW3 wide on CCI0, IMX258 / GC5035 /
+ * IMX616 on CCI1 bus 0, FP5529 autofocus on CCI1 bus 1, rails from the
+ * S2MPB03 camera PMIC (the stock DTBO created that node; with our dtbo it is
+ * described here). m52xq drivers: s2mpb03, s5kgw3, gc5035, imx616, fp5529.
+ */
+/ {
+	vreg_imx258_vana: regulator-imx258-vana {
+		compatible = "regulator-fixed";
+		regulator-name = "imx258_vana";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&tlmm 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <1000>;
+	};
+
+	vreg_imx258_dvdd: regulator-imx258-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "imx258_dvdd";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+	};
+
+	vreg_gc5035_avdd: regulator-gc5035-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "gc5035_avdd";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&tlmm 14 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <1000>;
+	};
+};
+
+&i2c0 {
+	clock-frequency = <400000>;
+
+	status = "okay";
+
+	pmic@56 {
+		compatible = "samsung,s2mpb03pmic";
+		reg = <0x56>;
+
+		regulators {
+			cam_ldo1: s2mpb03-ldo1 {
+				regulator-name = "CAM0_s2mpb03-l1";
+				regulator-min-microvolt = <1050000>;
+				regulator-max-microvolt = <1050000>;
+			};
+
+			cam_ldo2: s2mpb03-ldo2 {
+				regulator-name = "CAM0_s2mpb03-l2";
+				regulator-min-microvolt = <1100000>;
+				regulator-max-microvolt = <1100000>;
+			};
+
+			cam_ldo3: s2mpb03-ldo3 {
+				regulator-name = "CAM0_s2mpb03-l3";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			cam_ldo4: s2mpb03-ldo4 {
+				regulator-name = "CAM0_s2mpb03-l4";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+			};
+
+			cam_ldo5: s2mpb03-ldo5 {
+				regulator-name = "CAM0_s2mpb03-l5";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+
+			cam_ldo6: s2mpb03-ldo6 {
+				regulator-name = "CAM0_s2mpb03-l6";
+				regulator-min-microvolt = <2900000>;
+				regulator-max-microvolt = <2900000>;
+			};
+
+			cam_ldo7: s2mpb03-ldo7 {
+				regulator-name = "CAM0_s2mpb03-l7";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+		};
+	};
+};
+
+&qup_i2c0_data_clk {
+	drive-strength = <2>;
+	bias-pull-up;
+};
+
+&tlmm {
+	cam_mclk0_default: cam-mclk0-default-state {
+		pins = "gpio64";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_mclk2_default: cam-mclk2-default-state {
+		pins = "gpio66";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_mclk3_default: cam-mclk3-default-state {
+		pins = "gpio67";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_mclk4_default: cam-mclk4-default-state {
+		pins = "gpio68";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&camss {
+	status = "okay";
+
+	ports {
+		port@0 {
+			csiphy0_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&s5kgw3_ep>;
+			};
+		};
+
+		port@2 {
+			csiphy2_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx258_ep>;
+			};
+		};
+
+		port@3 {
+			csiphy3_ep: endpoint {
+				data-lanes = <0 1>;
+				remote-endpoint = <&gc5035_ep>;
+			};
+		};
+
+		port@4 {
+			csiphy4_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx616_ep>;
+			};
+		};
+	};
+};
+
+&cci0 {
+	pinctrl-0 = <&cci0_default>;
+	pinctrl-1 = <&cci0_sleep>;
+
+	status = "okay";
+};
+
+&cci0_i2c0 {
+	clock-frequency = <400000>;
+
+	camera@2d {
+		compatible = "samsung,s5kgw3";
+		reg = <0x2d>;
+
+		clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 20 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam_mclk0_default>;
+		pinctrl-names = "default";
+
+		vio-supply = <&cam_ldo3>;
+		vdig-supply = <&cam_ldo2>;
+		vana-supply = <&cam_ldo5>;
+		vaf-supply = <&cam_ldo7>;
+
+		lens-focus = <&wide_af>;
+		rotation = <270>;
+		orientation = <1>;
+
+		port {
+			s5kgw3_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <1011200000>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
+};
+
+&cci1 {
+	status = "okay";
+};
+
+&cci1_i2c0 {
+	clock-frequency = <400000>;
+
+	camera@10 {
+		compatible = "sony,imx258";
+		reg = <0x10>;
+
+		clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK2_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 77 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam_mclk2_default>;
+		pinctrl-names = "default";
+
+		vana-supply = <&vreg_imx258_vana>;
+		vdig-supply = <&vreg_imx258_dvdd>;
+		vif-supply = <&cam_ldo3>;
+
+		rotation = <270>;
+		orientation = <1>;
+
+		port {
+			imx258_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <633600000>;
+				remote-endpoint = <&csiphy2_ep>;
+			};
+		};
+	};
+
+	camera@1a {
+		compatible = "sony,imx616";
+		reg = <0x1a>;
+
+		clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK4_CLK>;
+		assigned-clock-rates = <24000000>;
+
+		reset-gpios = <&tlmm 79 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam_mclk4_default>;
+		pinctrl-names = "default";
+
+		vio-supply = <&cam_ldo3>;
+		vdig-supply = <&cam_ldo1>;
+		vana-supply = <&cam_ldo6>;
+
+		rotation = <90>;
+		orientation = <0>;
+
+		port {
+			imx616_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <1028000000>;
+				remote-endpoint = <&csiphy4_ep>;
+			};
+		};
+	};
+
+	camera@3f {
+		compatible = "galaxycore,gc5035";
+		reg = <0x3f>;
+
+		clocks = <&camcc CAM_CC_MCLK3_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK3_CLK>;
+		assigned-clock-rates = <24000000>;
+
+		reset-gpios = <&tlmm 78 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&cam_mclk3_default>;
+		pinctrl-names = "default";
+
+		avdd-supply = <&vreg_gc5035_avdd>;
+		dovdd-supply = <&cam_ldo3>;
+		dvdd-supply = <&cam_ldo4>;
+
+		rotation = <270>;
+		orientation = <1>;
+
+		port {
+			gc5035_ep: endpoint {
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <438000000>;
+				remote-endpoint = <&csiphy3_ep>;
+			};
+		};
+	};
+};
+
+&cci1_i2c1 {
+	clock-frequency = <400000>;
+
+	wide_af: focus@c {
+		compatible = "fitipower,fp5529";
+		reg = <0x0c>;
+
+		vio-supply = <&cam_ldo3>;
+		vcc-supply = <&cam_ldo7>;
+
+		fitipower,initial-position = <345>;
+	};
+};
+
+/*
+ * Venus: firmware as on the rootfs; the m52xq venus-core ("sec3" build,
+ * m52xq_sec_persist=1) takes the encoder PERSIST buffer from this secure
+ * non-pixel context (downstream venus_sec_non_pixel), as in the working DT.
+ */
+&venus {
+	firmware-name = "qcom/vpu-2.0/venus.mbn";
+
+	video-secure-nonpixel {
+		iommus = <&apps_smmu 0x2184 0x20>;
+	};
+};
